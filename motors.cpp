@@ -1,246 +1,286 @@
 #include "motors.h"
 #include "sensors.h"
-#include <AccelStepper.h>
 
-// ==================== PINS ====================
-#define STEP_X 2
-#define DIR_X  5
-#define STEP_Y 3
-#define DIR_Y  6
-#define STEP_A 4
-#define DIR_A  7
-#define STEP_Z 12
-#define DIR_Z  13
-
-static AccelStepper stepperX(AccelStepper::DRIVER, STEP_X, DIR_X);
-static AccelStepper stepperY(AccelStepper::DRIVER, STEP_Y, DIR_Y);
-static AccelStepper stepperA(AccelStepper::DRIVER, STEP_A, DIR_A);
-static AccelStepper stepperZ(AccelStepper::DRIVER, STEP_Z, DIR_Z);
-
-// ==================== AXIS TABLE ====================
+// One entry per axis. Every function below works on this table, so the
+// X, Y, A and Z logic is written only once.
+//
+// sign: converts logical position to motor steps (motorSteps = sign * logical).
+//       -1 inverts the physical direction. Homing always moves toward the
+//       limit switch, i.e. toward logical negative.
+// stopOnLimit: if true, a normal move toward zero is cancelled when the
+//       limit switch activates (used by Z as a crash protection).
+// limitedSearch: if true, homing fails after HOMING_MAX_STEPS (X, Y, A).
 struct Axis {
+  // ----- fixed configuration -----
+  uint8_t stepPin, dirPin, limitPin;
   char name;
-  AccelStepper* stepper;
-  LimitId limit;
-  long maxPos;        // software limit (user steps)
-  int8_t sign;        // user position = sign * stepper position
-  AxisState state;
-  bool homed;
+  int8_t sign;
+  long maxTravel;
+  float maxSpeed;      // steps/s
+  float accel;         // steps/s^2
+  bool stopOnLimit;
+  bool limitedSearch;
+
+  // ----- runtime state (motor domain: motor steps, not logical) -----
+  bool referenced;
+  bool moving;         // true while a ramped move is in progress
   long searchSteps;
+  long pos;            // current position in motor steps
+  long target;         // target position in motor steps
+  float speed;         // current speed magnitude, steps/s
+  unsigned long intervalUs;   // time between steps, 0 = not stepping
+  unsigned long lastStepUs;   // time of the last step
+  int8_t stepDir;      // direction of the next steps: +1 or -1
+  int8_t dirLevel;     // level currently on the DIR pin: +1, -1, 0 = unknown
+
+  Axis(uint8_t sp, uint8_t dp, uint8_t lp, char n, int8_t s, long travel,
+       float vmax, float acc, bool stopLimit, bool limitSearch)
+    : stepPin(sp), dirPin(dp), limitPin(lp), name(n), sign(s),
+      maxTravel(travel), maxSpeed(vmax), accel(acc),
+      stopOnLimit(stopLimit), limitedSearch(limitSearch),
+      referenced(false), moving(false), searchSteps(0), pos(0), target(0),
+      speed(0), intervalUs(0), lastStepUs(0), stepDir(1), dirLevel(0) {}
 };
 
-// Homing direction in stepper domain is always -sign.
+//                 step pin    dir pin    limit pin    name sign travel        speed        accel        stopOnLimit limitedSearch
 static Axis axes[AXIS_COUNT] = {
-  { 'X', &stepperX, LIMIT_X, 30450L, -1, AXIS_IDLE, false, 0 },
-  { 'Y', &stepperY, LIMIT_Y, 11834L, -1, AXIS_IDLE, false, 0 },
-  { 'A', &stepperA, LIMIT_A,  3426L, +1, AXIS_IDLE, false, 0 },
-  { 'Z', &stepperZ, LIMIT_Z, 47829L, +1, AXIS_IDLE, false, 0 },
+  Axis(STEP_X_PIN, DIR_X_PIN, LIMIT_X_PIN, 'X', -1, MAX_TRAVEL_X, MOVE_SPEED_X, MOVE_ACCEL_X, false, true),
+  Axis(STEP_Y_PIN, DIR_Y_PIN, LIMIT_Y_PIN, 'Y', -1, MAX_TRAVEL_Y, MOVE_SPEED_Y, MOVE_ACCEL_Y, false, true),
+  Axis(STEP_A_PIN, DIR_A_PIN, LIMIT_A_PIN, 'A',  1, MAX_TRAVEL_A, MOVE_SPEED_A, MOVE_ACCEL_A, false, true),
+  Axis(STEP_Z_PIN, DIR_Z_PIN, LIMIT_Z_PIN, 'Z',  1, MAX_TRAVEL_Z, MOVE_SPEED_Z, MOVE_ACCEL_Z, true,  false)
 };
 
-static float travelSpeed  = DEFAULT_SPEED;
-static float acceleration = DEFAULT_ACCELERATION;
+// Time of the last ramp update (shared by all axes).
+static unsigned long lastRampUs = 0;
+// A ramp update never integrates more than this, so the first update after
+// an idle period does not make the speed jump.
+static const unsigned long RAMP_MAX_ELAPSED_US = 10000;
 
-// ==================== HELPERS ====================
-static void logAxis(const Axis& ax, const __FlashStringHelper* msg) {
-  Serial.print(F("[MOTOR] ")); Serial.print(ax.name);
-  Serial.print(F(": ")); Serial.println(msg);
-}
-
-static void logAxisValue(const Axis& ax, const __FlashStringHelper* msg, long value) {
-  Serial.print(F("[MOTOR] ")); Serial.print(ax.name);
-  Serial.print(F(": ")); Serial.print(msg); Serial.println(value);
-}
-
-static void applyMotion(Axis& ax) {
-  ax.stepper->setMaxSpeed(travelSpeed);
-  ax.stepper->setAcceleration(acceleration);
-}
-
-static bool movingTowardHome(const Axis& ax) {
-  long dist = ax.stepper->distanceToGo();
-  return (ax.sign < 0) ? (dist > 0) : (dist < 0);
-}
-
-// ==================== HOMING ====================
-static void finishHoming(Axis& ax) {
-  ax.stepper->setCurrentPosition(0);
-  applyMotion(ax);                       // restore travel speed after homing
-  ax.homed = true;
-  ax.state = AXIS_IDLE;
-  logAxisValue(ax, F("limit reached, zero set. Search steps = "), ax.searchSteps);
-}
-
-void homeAxis(AxisId id) {
-  Axis& ax = axes[id];
-  ax.homed = false;
-  ax.searchSteps = 0;
-  ax.stepper->setCurrentPosition(0);
-
-  if (limitActive(ax.limit)) {
-    applyMotion(ax);
-    ax.homed = true;
-    ax.state = AXIS_IDLE;
-    logAxis(ax, F("limit already active, zero set"));
-    return;
+// ==================== LOW LEVEL STEP GENERATION ====================
+// Sends one STEP pulse in direction a.stepDir. The DIR pin is only written
+// when the direction changes (saves time on every step).
+static void doStep(Axis &a) {
+  if (a.dirLevel != a.stepDir) {
+    digitalWrite(a.dirPin, a.stepDir > 0 ? HIGH : LOW);
+    a.dirLevel = a.stepDir;
+    delayMicroseconds(DIR_SETUP_US);
   }
-
-  ax.stepper->setMaxSpeed(HOMING_SPEED);
-  ax.stepper->setSpeed(-ax.sign * HOMING_SPEED);
-  ax.state = AXIS_HOMING;
-  logAxis(ax, F("homing: searching limit switch..."));
+  digitalWrite(a.stepPin, HIGH);
+  delayMicroseconds(STEP_PULSE_US);
+  digitalWrite(a.stepPin, LOW);
+  a.pos += a.stepDir;
 }
 
-// ==================== MOVEMENT ====================
-bool moveAxis(AxisId id, long target) {
-  Axis& ax = axes[id];
-
-  if (!ax.homed) {
-    logAxis(ax, F("not homed, move rejected"));
-    return false;
-  }
-
-  long requested = target;
-  target = constrain(target, 0L, ax.maxPos);
-  if (target != requested) logAxisValue(ax, F("target clamped to "), target);
-
-  ax.stepper->moveTo(ax.sign * target);
-
-  if (ax.stepper->distanceToGo() == 0) {
-    ax.state = AXIS_IDLE;
-    logAxisValue(ax, F("already at "), target);
-  } else {
-    ax.state = AXIS_MOVING;
-    logAxisValue(ax, F("moving to "), target);
-  }
+// Sends a step if the interval since the previous one has elapsed.
+// Returns true if a step was sent. Uses "last += interval" so the average
+// rate is exact; if the loop was late by more than one interval it
+// resynchronizes instead of sending a burst of steps.
+static bool stepIfDue(Axis &a) {
+  if (a.intervalUs == 0) return false;
+  unsigned long now = micros();
+  if (now - a.lastStepUs < a.intervalUs) return false;
+  a.lastStepUs += a.intervalUs;
+  if (now - a.lastStepUs >= a.intervalUs) a.lastStepUs = now;
+  doStep(a);
   return true;
 }
 
-// ==================== UPDATE ====================
-static void updateAxis(Axis& ax) {
-  switch (ax.state) {
-    case AXIS_HOMING:
-      if (limitActive(ax.limit)) {
-        finishHoming(ax);
-      } else if (ax.searchSteps >= MAX_SEARCH_STEPS) {
-        ax.state = AXIS_ERROR;
-        ax.stepper->setSpeed(0);
-        logAxisValue(ax, F("ERROR: limit not found after steps = "), ax.searchSteps);
-      } else if (ax.stepper->runSpeed()) {
-        ax.searchSteps++;
-      }
-      break;
-
-    case AXIS_MOVING:
-      if (movingTowardHome(ax) && limitActive(ax.limit)) {
-        ax.stepper->setCurrentPosition(0);
-        ax.state = AXIS_IDLE;
-        logAxis(ax, F("limit hit while moving, stopped and re-zeroed"));
-      } else {
-        ax.stepper->run();
-        if (ax.stepper->distanceToGo() == 0) {
-          ax.state = AXIS_IDLE;
-          logAxisValue(ax, F("arrived at "), axisPosition((AxisId)(&ax - axes)));
-        }
-      }
-      break;
-
-    default:
-      break;
-  }
+static void clearMotion(Axis &a) {
+  a.moving = false;
+  a.speed = 0;
+  a.intervalUs = 0;
 }
 
-void motorsUpdate() {
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) updateAxis(axes[i]);
+// ==================== SPEED RAMP ====================
+// Trapezoidal profile without square roots: if the speed is large enough
+// that the axis could not stop before the target at the configured
+// acceleration (v^2 >= 2*a*distance), decelerate; otherwise accelerate up to
+// the maximum speed.
+static void rampUpdate(Axis &a, float dt) {
+  long remaining = a.target - a.pos;
+  if (remaining == 0) { clearMotion(a); return; }
+
+  long dist = (remaining > 0) ? remaining : -remaining;
+  a.stepDir = (remaining > 0) ? 1 : -1;
+
+  float v = a.speed;
+  if (v * v >= 2.0f * a.accel * (float)dist) v -= a.accel * dt;
+  else                                        v += a.accel * dt;
+
+  if (v > a.maxSpeed) v = a.maxSpeed;
+  if (v < RAMP_START_SPEED) v = RAMP_START_SPEED;
+
+  a.speed = v;
+  a.intervalUs = (unsigned long)(1000000.0f / v);
 }
 
-void motorsStop() {
+// Updates the ramp of all moving axes every RAMP_UPDATE_US.
+static void rampTick() {
+  unsigned long now = micros();
+  unsigned long elapsed = now - lastRampUs;
+  if (elapsed < RAMP_UPDATE_US) return;
+  lastRampUs = now;
+  if (elapsed > RAMP_MAX_ELAPSED_US) elapsed = RAMP_MAX_ELAPSED_US;
+  float dt = (float)elapsed * 1.0e-6f;
+
   for (uint8_t i = 0; i < AXIS_COUNT; i++) {
-    Axis& ax = axes[i];
-    ax.stepper->setCurrentPosition(ax.stepper->currentPosition());  // clears target and speed
-    applyMotion(ax);
-    ax.state = AXIS_IDLE;
-    if (i != AXIS_Z) ax.homed = false;   // Z keeps its tracked position (it has no homing)
+    if (axes[i].moving) rampUpdate(axes[i], dt);
   }
-  Serial.println(F("[MOTOR] All axes stopped, X/Y/A need re-homing"));
 }
 
-// ==================== SETTINGS ====================
-float setTravelSpeed(float stepsPerSecond) {
-  travelSpeed = constrain(stepsPerSecond, MIN_SPEED, MAX_SPEED_LIMIT);
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
-    if (axes[i].state != AXIS_HOMING) applyMotion(axes[i]);
-  }
-  return travelSpeed;
+// Sends the due step of one moving axis. Returns true while it is moving.
+static bool stepAxisMove(Axis &a) {
+  if (!a.moving) return false;
+
+  long remaining = a.target - a.pos;
+  if (remaining == 0) { clearMotion(a); return false; }
+
+  // Direction mismatch (should not happen): wait for the next ramp update.
+  if ((remaining > 0) != (a.stepDir > 0)) return true;
+
+  stepIfDue(a);
+  return true;
 }
 
-float setAcceleration(float stepsPerSecond2) {
-  acceleration = constrain(stepsPerSecond2, MIN_ACCELERATION, MAX_ACCELERATION);
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
-    if (axes[i].state != AXIS_HOMING) applyMotion(axes[i]);
-  }
-  return acceleration;
-}
-
+// ==================== INIT AND LOOKUP ====================
 void motorsInit() {
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) applyMotion(axes[i]);
-  motorsPrintSettings();
-}
-
-// ==================== QUERIES ====================
-AxisState axisState(AxisId id) { return axes[id].state; }
-char axisName(AxisId id) { return axes[id].name; }
-
-long axisPosition(AxisId id) {
-  return axes[id].sign * axes[id].stepper->currentPosition();
-}
-
-bool allHomed() {
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) if (!axes[i].homed) return false;
-  return true;
-}
-
-bool axesIdle() {
   for (uint8_t i = 0; i < AXIS_COUNT; i++) {
-    if (axes[i].state == AXIS_HOMING || axes[i].state == AXIS_MOVING) return false;
+    pinMode(axes[i].stepPin, OUTPUT);
+    pinMode(axes[i].dirPin, OUTPUT);
+    digitalWrite(axes[i].stepPin, LOW);
   }
-  return true;
 }
 
-bool anyAxisError() {
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) if (axes[i].state == AXIS_ERROR) return true;
+char motorsName(AxisId id) {
+  return axes[id].name;
+}
+
+bool motorsAxisFromChar(char c, AxisId *id) {
+  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+    if (axes[i].name == c) {
+      *id = (AxisId)i;
+      return true;
+    }
+  }
   return false;
 }
 
-// ==================== PRINTING ====================
-void motorsPrintPositions() {
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
-    Serial.print(axes[i].name);
-    Serial.print('=');
-    Serial.print(axisPosition((AxisId)i));
-    if (i < AXIS_COUNT - 1) Serial.print(' ');
+// ==================== HOMING ====================
+bool motorsHomingStart(AxisId id) {
+  Axis &a = axes[id];
+  clearMotion(a);
+  a.referenced = false;
+  a.searchSteps = 0;
+  a.pos = 0;
+  a.target = 0;
+
+  if (sensorsLimitActive(a.limitPin)) {
+    a.referenced = true;
+    return false;
   }
-  Serial.println();
+
+  // Constant-speed search: speed is set by HOMING_SPEED in motors.h.
+  a.stepDir = -a.sign;
+  a.intervalUs = (unsigned long)(1000000.0f / HOMING_SPEED);
+  a.lastStepUs = micros();
+  return true;
 }
 
-void motorsPrintSettings() {
-  Serial.print(F("[MOTOR] speed="));
-  Serial.print(travelSpeed, 0);
-  Serial.print(F(" steps/s | acc="));
-  Serial.print(acceleration, 0);
-  Serial.print(F(" steps/s2 | homed: "));
-  bool any = false;
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
-    if (axes[i].homed) { Serial.print(axes[i].name); any = true; }
+HomingStatus motorsHomingUpdate(AxisId id) {
+  Axis &a = axes[id];
+
+  if (sensorsLimitActive(a.limitPin)) {
+    clearMotion(a);
+    a.pos = 0;
+    a.target = 0;
+    a.referenced = true;
+    return HOMING_DONE;
   }
-  if (!any) Serial.print('-');
-  Serial.println();
+  if (a.limitedSearch && a.searchSteps >= HOMING_MAX_STEPS) {
+    return HOMING_FAILED;
+  }
+  if (stepIfDue(a)) {
+    a.searchSteps++;
+  }
+  return HOMING_RUNNING;
 }
 
-void setZeroHere(AxisId id) {
-  Axis& ax = axes[id];
-  ax.stepper->setCurrentPosition(0);
-  applyMotion(ax);
-  ax.homed = true;
-  ax.state = AXIS_IDLE;
-  logAxis(ax, F("zero set at current position (no limit search)"));
+long motorsSearchSteps(AxisId id) {
+  return axes[id].searchSteps;
+}
+
+// ==================== MOVEMENT ====================
+MoveStart motorsMoveTo(AxisId id, long target) {
+  Axis &a = axes[id];
+  if (!a.referenced) return MOVE_NOT_REFERENCED;
+
+  target = constrain(target, 0L, a.maxTravel);
+  a.target = a.sign * target;
+
+  if (a.target == a.pos) {
+    clearMotion(a);
+    return MOVE_ALREADY_THERE;
+  }
+
+  // The ramp starts from zero speed; the next ramp update sets the speed.
+  a.moving = true;
+  a.speed = 0;
+  a.intervalUs = 0;
+  a.stepDir = (a.target > a.pos) ? 1 : -1;
+  a.lastStepUs = micros();
+  return MOVE_STARTED;
+}
+
+MoveStatus motorsRunAxis(AxisId id) {
+  Axis &a = axes[id];
+
+  // Remaining logical distance < 0 means the axis is moving toward zero.
+  if (a.stopOnLimit && a.moving && (a.sign * (a.target - a.pos)) < 0 &&
+      sensorsLimitActive(a.limitPin)) {
+    clearMotion(a);
+    a.pos = 0;
+    a.target = 0;
+    return MOVE_LIMIT_HIT;
+  }
+
+  rampTick();
+  return stepAxisMove(a) ? MOVE_RUNNING : MOVE_DONE;
+}
+
+bool motorsRunAll() {
+  rampTick();
+  bool running = false;
+  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+    if (stepAxisMove(axes[i])) running = true;
+  }
+  return running;
+}
+
+// ==================== QUERIES ====================
+long motorsPosition(AxisId id) {
+  return axes[id].sign * axes[id].pos;
+}
+
+long motorsTarget(AxisId id) {
+  return axes[id].sign * axes[id].target;
+}
+
+bool motorsIsReferenced(AxisId id) {
+  return axes[id].referenced;
+}
+
+bool motorsAllReferenced() {
+  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+    if (!axes[i].referenced) return false;
+  }
+  return true;
+}
+
+// ==================== STOP ====================
+void motorsStopAll() {
+  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+    clearMotion(axes[i]);
+    axes[i].target = axes[i].pos;
+    axes[i].referenced = false;
+  }
 }

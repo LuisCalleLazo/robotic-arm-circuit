@@ -2,251 +2,257 @@
 #include "sensors.h"
 #include "servo.h"
 
-// ==================== CONFIG ====================
-// Start position (user steps)
-const long START_X = 8000L;
-const long START_Y = 5500L;
-const long START_A = 1200L;
-const long START_Z = 0L;
+// ==================== SERIAL PROTOCOL (FOR THE HMI) ====================
+// Every line sent by the Arduino is CSV: TAG,field,field,...
+//
+//   STATE,<name>                     state machine changed state
+//   EVT,<name>[,<axis>,<value>]      event (homing, moves, route, servo)
+//   POS,X=<n>,Y=<n>,A=<n>,Z=<n>      current logical positions in steps
+//   ERR,<code>[,<axis>]              error
+//   CMD,<text>                       echo of the command received
+//   INFO,<text>                      free text
+//
+// Commands accepted (newline terminated, case and spaces ignored):
+//   X | Y | A | Z     home that axis
+//   X500 | Y200 ...   move that axis to the given step position
+//   R | START | INICIAR   run the route (all axes must be homed)
+//   P | STOP              stop everything (axes must be homed again)
+//   ? | POS | POSICION    print state and positions
 
-const unsigned long DELAY_BEFORE_A_MS          = 800;
-const unsigned long DELAY_BETWEEN_WAYPOINTS_MS = 2000;
-const unsigned long LIVE_LOG_INTERVAL_MS       = 250;
-const unsigned long COMMAND_TIMEOUT_MS         = 120;
+// ==================== TIMING CONFIGURATION ====================
+// Pause after X, Y and Z reach the home pose and before A moves.
+const unsigned long DELAY_BEFORE_A_MS = 800;
+// Pause after each route pose is reached.
+const unsigned long DELAY_BETWEEN_POSES_MS = 2000;
+// Position streaming period while moving. Set to 0 to disable.
+// Keep it above ~150 ms so serial output does not disturb step timing.
+const unsigned long POS_STREAM_INTERVAL_MS = 250;
 
-// Homing order
-// Axes that search their limit switch (Z is NOT homed)
-const AxisId HOMING_AXES[] = { AXIS_X, AXIS_Y, AXIS_A };
-const byte HOMING_COUNT = sizeof(HOMING_AXES) / sizeof(HOMING_AXES[0]);
+// ==================== POSES AND ROUTE ====================
+const int SERVO_NONE = -1;
 
-// Run the route automatically after the boot homing
-const bool AUTO_START_ROUTE = true;
-// Route. servoAngle < 0 means no servo action on arrival.
-const int NO_SERVO = -1;
-
-struct Waypoint {
+struct Pose {
   long x, y, a, z;
-  int servoAngle;
+  int servoAngle;  // moved when the pose is reached, SERVO_NONE to skip
 };
 
-const Waypoint ROUTE[] = {
-  {  8000L, 5500L, 1200L, 41000L, SERVO_CLOSED_ANGLE },  // 1
-  {  8000L, 5500L, 1200L,     0L, NO_SERVO },            // 1.1
-  { 16000L, 5500L, 1200L,     0L, NO_SERVO },            // 1.2
-  { 16000L, 5500L, 1200L, 41000L, SERVO_OPEN_ANGLE },    // 1.3
-  { 16000L, 5500L, 1200L,     0L, NO_SERVO },            // 1.4
+// Pose reached after homing and after the route ends.
+const Pose HOME_POSE = { 8000, 5500, 1200, 0, SERVO_NONE };
+
+// Route executed by R / START. Edit this table to change the sequence.
+const Pose ROUTE[] = {
+  //  X      Y     A     Z      servo on arrival
+  {  8000, 5500, 1200, 41000, SERVO_CLOSED_ANGLE },  // 1   : pick
+  {  8000, 5500, 1200,     0, SERVO_NONE },          // 1.1 : lift
+  { 16000, 5500, 1200,     0, SERVO_NONE },          // 1.2 : travel
+  { 16000, 5500, 1200, 41000, SERVO_OPEN_ANGLE },    // 1.3 : place
+  { 16000, 5500, 1200,     0, SERVO_NONE }           // 1.4 : lift
 };
-const byte ROUTE_LENGTH = sizeof(ROUTE) / sizeof(ROUTE[0]);
+const uint8_t ROUTE_LENGTH = sizeof(ROUTE) / sizeof(ROUTE[0]);
 
-// ==================== SEQUENCER STATE ====================
-enum Mode : uint8_t {
-  MODE_IDLE,
-  MODE_RAISE_Z,
-  MODE_HOMING,
-  MODE_GO_START_XYZ,
-  MODE_START_PAUSE,
-  MODE_GO_START_A,
-  MODE_ROUTE_MOVE,
-  MODE_ROUTE_WAIT,
-  MODE_ERROR
+// Homing order at power on.
+const AxisId HOMING_ORDER[AXIS_COUNT] = { AXIS_Z, AXIS_X, AXIS_A, AXIS_Y };
+
+// ==================== STATE MACHINE ====================
+enum State : uint8_t {
+  ST_IDLE,
+  ST_HOMING,
+  ST_MOVING_AXIS,
+  ST_GOTO_HOME_POSE,
+  ST_WAIT_BEFORE_A,
+  ST_MOVING_A,
+  ST_ROUTE_MOVING,
+  ST_ROUTE_WAIT,
+  ST_ERROR
 };
 
-Mode mode = MODE_IDLE;
-bool runAfterHoming = false;
-byte routeIndex = 0;
-unsigned long timerStart = 0;
+State state = ST_IDLE;
+AxisId activeAxis = AXIS_X;
+bool autoHoming = false;
+uint8_t homingIndex = 0;
+uint8_t routeStep = 0;
+unsigned long waitStart = 0;
+unsigned long lastPosLog = 0;
 
-bool liveLog = true;
-unsigned long lastLiveLog = 0;
-
-// ==================== HELPERS ====================
-static const __FlashStringHelper* modeName() {
-  switch (mode) {
-    case MODE_IDLE:          return F("IDLE");
-    case MODE_HOMING:        return F("HOMING");
-    case MODE_GO_START_XYZ:  return F("GO_START_XYZ");
-    case MODE_START_PAUSE:   return F("START_PAUSE");
-    case MODE_GO_START_A:    return F("GO_START_A");
-    case MODE_ROUTE_MOVE:    return F("ROUTE_MOVE");
-    case MODE_ROUTE_WAIT:    return F("ROUTE_WAIT");
-    case MODE_ERROR:         return F("ERROR");
-    case MODE_RAISE_Z:       return F("RAISE_Z");
-  }
-  return F("?");
-}
-
-static bool busy() {
-  return (mode != MODE_IDLE && mode != MODE_ERROR) || !axesIdle();
-}
-
-static void enterError(const __FlashStringHelper* reason) {
-  motorsStop();
-  mode = MODE_ERROR;
-  Serial.print(F("[SEQ] ERROR: "));
-  Serial.println(reason);
-  Serial.println(F("[SEQ] Send H to re-home or P to clear."));
-}
-
-static void printStatus() {
-  Serial.print(F("[STATUS] mode="));
-  Serial.println(modeName());
-  Serial.print(F("[STATUS] pos: "));
-  motorsPrintPositions();
-  motorsPrintSettings();
-  sensorsPrintStatus();
-}
-
-static void printHelp() {
-  Serial.println(F("[HELP] X Y A Z     home one axis"));
-  Serial.println(F("[HELP] X500        move axis to position (steps)"));
-  Serial.println(F("[HELP] H           home all axes"));
-  Serial.println(F("[HELP] R / START   run route"));
-  Serial.println(F("[HELP] P / STOP    stop (re-homing required)"));
-  Serial.println(F("[HELP] S4000       set speed (steps/s), S alone = show"));
-  Serial.println(F("[HELP] C2000       set acceleration, C alone = show"));
-  Serial.println(F("[HELP] L           toggle live position log"));
-  Serial.println(F("[HELP] ? / STATUS  show status"));
-}
-
-// ==================== SEQUENCES ====================
-static void startHomingSequence(bool thenRunRoute) {
-  runAfterHoming = thenRunRoute;
-  Serial.println(F("[SEQ] Z has no limit search. Raising Z to 0, then homing X, Y, A together"));
-  if (!moveAxis(AXIS_Z, 0)) { enterError(F("Z move rejected")); return; }
-  mode = MODE_RAISE_Z;
-}
-
-static void goToStart() {
-  bool ok = moveAxis(AXIS_X, START_X);
-  ok &= moveAxis(AXIS_Y, START_Y);
-  ok &= moveAxis(AXIS_Z, START_Z);
-  if (!ok) { enterError(F("start move rejected")); return; }
-  mode = MODE_GO_START_XYZ;
-}
-
-static void startWaypoint(byte index) {
-  const Waypoint& w = ROUTE[index];
-  Serial.print(F("[SEQ] Waypoint "));
-  Serial.print(index + 1);
-  Serial.print('/');
-  Serial.println(ROUTE_LENGTH);
-
-  bool ok = moveAxis(AXIS_X, w.x);
-  ok &= moveAxis(AXIS_Y, w.y);
-  ok &= moveAxis(AXIS_A, w.a);
-  ok &= moveAxis(AXIS_Z, w.z);
-  if (!ok) { enterError(F("waypoint move rejected")); return; }
-  mode = MODE_ROUTE_MOVE;
-}
-
-static void startRoute() {
-  routeIndex = 0;
-  Serial.println(F("[SEQ] Route started"));
-  startWaypoint(0);
-}
-
-static void stopAll() {
-  motorsStop();
-  mode = MODE_IDLE;
-  Serial.println(F("[SEQ] Stopped. Send H to re-home."));
-}
-
-static void updateSequence() {
-  if (mode != MODE_ERROR && anyAxisError()) {
-    enterError(F("limit switch not found"));
-    return;
-  }
-
-  switch (mode) {
-    
-
-    case MODE_HOMING:
-      if (axesIdle()) {
-        Serial.println(F("[SEQ] X, Y, A homed. Going to start position..."));
-        goToStart();
-      }
-      break;
-
-    case MODE_GO_START_XYZ:
-      if (axesIdle()) {
-        timerStart = millis();
-        mode = MODE_START_PAUSE;
-        Serial.println(F("[SEQ] X, Y, Z in place. Pause before moving A..."));
-      }
-      break;
-
-    case MODE_START_PAUSE:
-      if (millis() - timerStart >= DELAY_BEFORE_A_MS) {
-        if (!moveAxis(AXIS_A, START_A)) { enterError(F("A move rejected")); break; }
-        mode = MODE_GO_START_A;
-      }
-      break;
-      
-    case MODE_GO_START_A:
-      if (axesIdle()) {
-        Serial.print(F("[SEQ] Start position reached: "));
-        motorsPrintPositions();
-        if (runAfterHoming) {
-          runAfterHoming = false;
-          Serial.println(F("[SEQ] Auto-starting route..."));
-          startRoute();
-        } else {
-          mode = MODE_IDLE;
-          Serial.println(F("[SEQ] Send R or START to run the route."));
-        }
-      }
-      break;
-
-    case MODE_ROUTE_MOVE:
-      if (axesIdle()) {
-        int angle = ROUTE[routeIndex].servoAngle;
-        if (angle != NO_SERVO) servoMove(angle);
-        timerStart = millis();
-        mode = MODE_ROUTE_WAIT;
-        Serial.print(F("[SEQ] Waypoint reached: "));
-        motorsPrintPositions();
-      }
-      break;
-
-    case MODE_ROUTE_WAIT:
-      if (millis() - timerStart >= DELAY_BETWEEN_WAYPOINTS_MS) {
-        routeIndex++;
-        if (routeIndex >= ROUTE_LENGTH) {
-          Serial.println(F("[SEQ] Route finished. Returning to start position..."));
-          goToStart();
-        } else {
-          startWaypoint(routeIndex);
-        }
-      }
-      break;
-    
-    case MODE_RAISE_Z:
-      if (axesIdle()) {
-        for (byte i = 0; i < HOMING_COUNT; i++) homeAxis(HOMING_AXES[i]);
-        mode = MODE_HOMING;
-      }
-      break;
-
-    default:
-      break;
+// ==================== LOGGING ====================
+const __FlashStringHelper *stateName(State s) {
+  switch (s) {
+    case ST_IDLE:           return F("IDLE");
+    case ST_HOMING:         return F("HOMING");
+    case ST_MOVING_AXIS:    return F("MOVING_AXIS");
+    case ST_GOTO_HOME_POSE: return F("GOTO_HOME_POSE");
+    case ST_WAIT_BEFORE_A:  return F("WAIT_BEFORE_A");
+    case ST_MOVING_A:       return F("MOVING_A");
+    case ST_ROUTE_MOVING:   return F("ROUTE_MOVING");
+    case ST_ROUTE_WAIT:     return F("ROUTE_WAIT");
+    default:                return F("ERROR");
   }
 }
 
-// ==================== COMMANDS ====================
-static bool onlyDigits(const char* s) {
-  if (*s == '\0') return false;
-  while (*s) { if (*s < '0' || *s > '9') return false; s++; }
-  return true;
+void setState(State s) {
+  if (s == state) return;
+  state = s;
+  Serial.print(F("STATE,"));
+  Serial.println(stateName(s));
 }
 
-static bool axisFromChar(char c, AxisId& id) {
-  for (byte i = 0; i < AXIS_COUNT; i++) {
-    if (axisName((AxisId)i) == c) { id = (AxisId)i; return true; }
+void logState() {
+  Serial.print(F("STATE,"));
+  Serial.println(stateName(state));
+}
+
+void logPosition() {
+  Serial.print(F("POS"));
+  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+    Serial.print(',');
+    Serial.print(motorsName((AxisId)i));
+    Serial.print('=');
+    Serial.print(motorsPosition((AxisId)i));
   }
+  Serial.println();
+}
+
+void logEvent(const __FlashStringHelper *name) {
+  Serial.print(F("EVT,"));
+  Serial.println(name);
+}
+
+void logAxisEvent(const __FlashStringHelper *name, AxisId id, long value) {
+  Serial.print(F("EVT,"));
+  Serial.print(name);
+  Serial.print(',');
+  Serial.print(motorsName(id));
+  Serial.print(',');
+  Serial.println(value);
+}
+
+void logError(const __FlashStringHelper *code) {
+  Serial.print(F("ERR,"));
+  Serial.println(code);
+}
+
+void logAxisError(const __FlashStringHelper *code, AxisId id) {
+  Serial.print(F("ERR,"));
+  Serial.print(code);
+  Serial.print(',');
+  Serial.println(motorsName(id));
+}
+
+bool isMovingState() {
+  return state == ST_MOVING_AXIS || state == ST_GOTO_HOME_POSE ||
+         state == ST_MOVING_A || state == ST_ROUTE_MOVING;
+}
+
+// Streams positions while an axis is moving so the HMI can animate.
+void streamPosition() {
+  if (POS_STREAM_INTERVAL_MS == 0 || !isMovingState()) return;
+  if (millis() - lastPosLog >= POS_STREAM_INTERVAL_MS) {
+    lastPosLog = millis();
+    logPosition();
+  }
+}
+
+// ==================== ACTIONS ====================
+// Starts the homing search of one axis.
+// Returns true if a search started, false if the limit was already active.
+bool beginHoming(AxisId id) {
+  if (motorsHomingStart(id)) {
+    logAxisEvent(F("HOMING_START"), id, 0);
+    setState(ST_HOMING);
+    return true;
+  }
+  logAxisEvent(F("HOMING_DONE"), id, 0);
   return false;
 }
 
-static void processCommand(const char* raw) {
+// Sets the X, Y, A and Z targets of a pose. Start of a simultaneous move.
+void setPoseTargets(const Pose &p) {
+  motorsMoveTo(AXIS_X, p.x);
+  motorsMoveTo(AXIS_Y, p.y);
+  motorsMoveTo(AXIS_A, p.a);
+  motorsMoveTo(AXIS_Z, p.z);
+}
+
+// Moves X, Y and Z to the home pose first; A moves later (see ST_WAIT_BEFORE_A).
+void goToHomePose() {
+  motorsMoveTo(AXIS_X, HOME_POSE.x);
+  motorsMoveTo(AXIS_Y, HOME_POSE.y);
+  motorsMoveTo(AXIS_Z, HOME_POSE.z);
+  logEvent(F("HOME_POSE_START"));
+  setState(ST_GOTO_HOME_POSE);
+}
+
+// Advances the automatic homing sequence to the next axis that needs a search.
+// When every axis is referenced it moves to the home pose.
+void continueAutoHoming() {
+  while (homingIndex < AXIS_COUNT) {
+    activeAxis = HOMING_ORDER[homingIndex];
+    if (beginHoming(activeAxis)) return;
+    homingIndex++;
+  }
+  autoHoming = false;
+  logEvent(F("HOMING_COMPLETE"));
+  goToHomePose();
+}
+
+void startAutoHoming() {
+  autoHoming = true;
+  homingIndex = 0;
+  continueAutoHoming();
+}
+
+void startRouteStep() {
+  if (routeStep >= ROUTE_LENGTH) {
+    logEvent(F("ROUTE_DONE"));
+    goToHomePose();
+    return;
+  }
+  setPoseTargets(ROUTE[routeStep]);
+  Serial.print(F("EVT,ROUTE_STEP,"));
+  Serial.println(routeStep);
+  setState(ST_ROUTE_MOVING);
+}
+
+void startRoute() {
+  if (state != ST_IDLE || !motorsAllReferenced()) {
+    logError(F("NOT_READY"));
+    return;
+  }
+  routeStep = 0;
+  logEvent(F("ROUTE_START"));
+  startRouteStep();
+}
+
+void stopAll() {
+  motorsStopAll();
+  autoHoming = false;
+  logEvent(F("STOPPED"));
+  setState(ST_IDLE);
+}
+
+// Runs the servo action of a pose and reports the result.
+void applyServo(int angle) {
+  if (angle == SERVO_NONE) return;
+  if (servoMove(angle)) {
+    Serial.print(F("EVT,SERVO,"));
+    Serial.println(angle);
+  } else {
+    logError(F("SERVO_FAILED"));
+  }
+}
+
+// ==================== COMMAND PARSER ====================
+bool onlyDigits(const char *s) {
+  if (*s == '\0') return false;
+  while (*s) {
+    if (*s < '0' || *s > '9') return false;
+    s++;
+  }
+  return true;
+}
+
+void processCommand(char *raw) {
+  // Remove spaces, tabs and '=', convert to upper case.
   char cmd[20];
   byte n = 0;
   for (byte i = 0; raw[i] && n < sizeof(cmd) - 1; i++) {
@@ -258,64 +264,68 @@ static void processCommand(const char* raw) {
   cmd[n] = '\0';
   if (!n) return;
 
-  Serial.print(F("[CMD] "));
+  Serial.print(F("CMD,"));
   Serial.println(cmd);
 
-  // ---- always allowed ----
-  if (!strcmp(cmd, "P") || !strcmp(cmd, "STOP")) { stopAll(); return; }
-  if (!strcmp(cmd, "?") || !strcmp(cmd, "POS") || !strcmp(cmd, "STATUS")) { printStatus(); return; }
-  if (!strcmp(cmd, "HELP")) { printHelp(); return; }
-  if (!strcmp(cmd, "L")) {
-    liveLog = !liveLog;
-    Serial.println(liveLog ? F("[CMD] Live log ON") : F("[CMD] Live log OFF"));
+  if (!strcmp(cmd, "?") || !strcmp(cmd, "POS") || !strcmp(cmd, "POSICION")) {
+    logState();
+    logPosition();
     return;
   }
 
-  // ---- run / home all ----
-  if (!strcmp(cmd, "R") || !strcmp(cmd, "START")) {
-    if (busy() || !allHomed()) {
-      Serial.println(F("[CMD] Cannot start: wait for homing to finish (or send H)."));
-      return;
-    }
+  // Same as the original: after a homing error nothing else is accepted
+  // until the board is reset.
+  if (state == ST_ERROR) { logError(F("RESET_REQUIRED")); return; }
+
+  if (!strcmp(cmd, "P") || !strcmp(cmd, "STOP")) { stopAll(); return; }
+  if (!strcmp(cmd, "R") || !strcmp(cmd, "START") || !strcmp(cmd, "INICIAR")) {
     startRoute();
     return;
   }
-  if (!strcmp(cmd, "H") || !strcmp(cmd, "HOME")) {
-    if (busy()) { Serial.println(F("[CMD] Busy. Wait or send P.")); return; }
-    startHomingSequence(false);
-    return;
-  }
 
-  // ---- speed / acceleration (also allowed while moving) ----
-  if (cmd[0] == 'S' || cmd[0] == 'C') {
-    if (cmd[1] == '\0') { motorsPrintSettings(); return; }
-    if (!onlyDigits(cmd + 1)) { Serial.println(F("[CMD] Invalid number.")); return; }
-    float value = (float)atol(cmd + 1);
-    if (cmd[0] == 'S') setTravelSpeed(value); else setAcceleration(value);
-    motorsPrintSettings();
-    return;
-  }
-
-  // ---- single axis ----
-  if (busy()) { Serial.println(F("[CMD] Busy. Wait or send P.")); return; }
+  if (state != ST_IDLE) { logError(F("BUSY")); return; }
 
   AxisId id;
-  if (!axisFromChar(cmd[0], id)) { Serial.println(F("[CMD] Unknown command. Send HELP.")); return; }
+  if (!motorsAxisFromChar(cmd[0], &id)) { logError(F("UNKNOWN_COMMAND")); return; }
 
-  if (cmd[1] == '\0') { homeAxis(id); return; }
-  if (!onlyDigits(cmd + 1)) { Serial.println(F("[CMD] Invalid format.")); return; }
-  moveAxis(id, atol(cmd + 1));
+  // Single letter: home that axis.
+  if (cmd[1] == '\0') {
+    autoHoming = false;
+    activeAxis = id;
+    beginHoming(id);
+    return;
+  }
+
+  // Letter plus number: move that axis.
+  if (!onlyDigits(cmd + 1)) { logError(F("BAD_FORMAT")); return; }
+
+  switch (motorsMoveTo(id, atol(cmd + 1))) {
+    case MOVE_NOT_REFERENCED:
+      logAxisError(F("NOT_REFERENCED"), id);
+      break;
+    case MOVE_ALREADY_THERE:
+      logAxisEvent(F("MOVE_DONE"), id, motorsPosition(id));
+      break;
+    case MOVE_STARTED:
+      activeAxis = id;
+      logAxisEvent(F("MOVE_START"), id, motorsTarget(id));
+      setState(ST_MOVING_AXIS);
+      break;
+  }
 }
 
 // ==================== SERIAL READER ====================
+// A command ends with a newline, or after TIME_END_COMMAND_MS without new
+// characters (useful when the terminal does not send a line ending).
 char serialBuffer[20];
 byte serialIndex = 0;
-unsigned long lastCharTime = 0;
+unsigned long lastSerialChar = 0;
+const unsigned long TIME_END_COMMAND_MS = 120;
 
-static void readSerial() {
+void readSerial() {
   while (Serial.available() > 0) {
     char ch = (char)Serial.read();
-    lastCharTime = millis();
+    lastSerialChar = millis();
     if (ch == '\r') continue;
     if (ch == '\n') {
       serialBuffer[serialIndex] = '\0';
@@ -325,44 +335,119 @@ static void readSerial() {
       serialBuffer[serialIndex++] = ch;
     }
   }
-  // Terminal without newline: process after a short idle time
-  if (serialIndex > 0 && millis() - lastCharTime >= COMMAND_TIMEOUT_MS) {
+  if (serialIndex > 0 && millis() - lastSerialChar >= TIME_END_COMMAND_MS) {
     serialBuffer[serialIndex] = '\0';
     processCommand(serialBuffer);
     serialIndex = 0;
   }
 }
 
-static void updateLiveLog() {
-  if (!liveLog || axesIdle()) return;
-  unsigned long now = millis();
-  if (now - lastLiveLog < LIVE_LOG_INTERVAL_MS) return;
-  lastLiveLog = now;
-  Serial.print(F("[LIVE] "));
-  Serial.print(now);
-  Serial.print(F(" ms | "));
-  motorsPrintPositions();
+// ==================== STATE MACHINE UPDATE ====================
+void updateStateMachine() {
+  switch (state) {
+
+    case ST_HOMING: {
+      HomingStatus status = motorsHomingUpdate(activeAxis);
+      if (status == HOMING_DONE) {
+        logAxisEvent(F("HOMING_DONE"), activeAxis, motorsSearchSteps(activeAxis));
+        if (autoHoming) {
+          homingIndex++;
+          continueAutoHoming();
+        } else {
+          setState(ST_IDLE);
+        }
+      } else if (status == HOMING_FAILED) {
+        logAxisError(F("HOMING_LIMIT_NOT_FOUND"), activeAxis);
+        autoHoming = false;
+        setState(ST_ERROR);
+      }
+      break;
+    }
+
+    case ST_MOVING_AXIS: {
+      MoveStatus status = motorsRunAxis(activeAxis);
+      if (status == MOVE_DONE) {
+        logAxisEvent(F("MOVE_DONE"), activeAxis, motorsPosition(activeAxis));
+        setState(ST_IDLE);
+      } else if (status == MOVE_LIMIT_HIT) {
+        logAxisEvent(F("LIMIT_HIT"), activeAxis, 0);
+        setState(ST_IDLE);
+      }
+      break;
+    }
+
+    case ST_GOTO_HOME_POSE:
+      if (!motorsRunAll()) {
+        waitStart = millis();
+        setState(ST_WAIT_BEFORE_A);
+      }
+      break;
+
+    case ST_WAIT_BEFORE_A:
+      if (millis() - waitStart >= DELAY_BEFORE_A_MS) {
+        motorsMoveTo(AXIS_A, HOME_POSE.a);
+        setState(ST_MOVING_A);
+      }
+      break;
+
+    case ST_MOVING_A:
+      if (motorsRunAxis(AXIS_A) != MOVE_RUNNING) {
+        logEvent(F("HOME_POSE_REACHED"));
+        logPosition();
+        setState(ST_IDLE);
+      }
+      break;
+
+    case ST_ROUTE_MOVING:
+      if (!motorsRunAll()) {
+        applyServo(ROUTE[routeStep].servoAngle);
+        logPosition();
+        waitStart = millis();
+        setState(ST_ROUTE_WAIT);
+      }
+      break;
+
+    case ST_ROUTE_WAIT:
+      if (millis() - waitStart >= DELAY_BETWEEN_POSES_MS) {
+        routeStep++;
+        startRouteStep();
+      }
+      break;
+
+    case ST_ERROR:
+      // Nothing moves. Reset the board and check the limit switch.
+      break;
+
+    default:
+      break;
+  }
 }
 
 // ==================== SETUP / LOOP ====================
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("[SYS] SCARA X Y A Z controller"));
-  printHelp();
+  Serial.setTimeout(100);
 
-  servoInit();
+  logEvent(F("BOOT"));
+
   sensorsInit();
   motorsInit();
-  sensorsPrintStatus();
 
-  setZeroHere(AXIS_Z);                    // Z assumed at its top position (0)
-  startHomingSequence(AUTO_START_ROUTE);
+  if (servoInit()) {
+    logEvent(F("SERVO_READY"));
+    servoMove(SERVO_OPEN_ANGLE);
+  } else {
+    logError(F("SERVO_NOT_FOUND"));
+  }
+
+  Serial.println(F("INFO,SCARA X Y A Z"));
+  Serial.println(F("INFO,Commands: X Y A Z | X500 | R | P | POS"));
+
+  startAutoHoming();
 }
 
 void loop() {
   readSerial();
-  sensorsUpdate();
-  motorsUpdate();
-  updateSequence();
-  updateLiveLog();
+  updateStateMachine();
+  streamPosition();
 }

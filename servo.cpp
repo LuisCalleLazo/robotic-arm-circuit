@@ -1,96 +1,105 @@
 #include "servo.h"
 
-// PCA9685 over software I2C
-#define PIN_SCL A0
-#define PIN_SDA A1
-#define PCA_ADDR 0x40
-#define SERVO_CHANNEL 0
+// Half-period of the software I2C clock. Increase if the bus is unreliable.
+#define I2C_DELAY_US 5
 
-static bool available = false;
+static bool servoReady = false;
 
-static void releaseLine(int pin) { pinMode(pin, INPUT_PULLUP); }
-static void pullLow(int pin) { digitalWrite(pin, LOW); pinMode(pin, OUTPUT); }
+// ==================== SOFTWARE I2C ====================
+static void i2cRelease(uint8_t pin) { pinMode(pin, INPUT_PULLUP); }
+static void i2cLow(uint8_t pin) { digitalWrite(pin, LOW); pinMode(pin, OUTPUT); }
+static void i2cDelay() { delayMicroseconds(I2C_DELAY_US); }
 
 static void i2cStart() {
-  releaseLine(PIN_SDA); releaseLine(PIN_SCL); delayMicroseconds(5);
-  pullLow(PIN_SDA); delayMicroseconds(5); pullLow(PIN_SCL);
+  i2cRelease(SERVO_SDA_PIN);
+  i2cRelease(SERVO_SCL_PIN);
+  i2cDelay();
+  i2cLow(SERVO_SDA_PIN);
+  i2cDelay();
+  i2cLow(SERVO_SCL_PIN);
 }
 
 static void i2cStop() {
-  pullLow(PIN_SDA); delayMicroseconds(5); releaseLine(PIN_SCL);
-  delayMicroseconds(5); releaseLine(PIN_SDA); delayMicroseconds(5);
+  i2cLow(SERVO_SDA_PIN);
+  i2cDelay();
+  i2cRelease(SERVO_SCL_PIN);
+  i2cDelay();
+  i2cRelease(SERVO_SDA_PIN);
+  i2cDelay();
 }
 
-static bool i2cSendByte(byte data) {
+// Sends one byte and returns true if the slave acknowledged it.
+static bool i2cWriteByte(byte data) {
   for (byte i = 0; i < 8; i++) {
-    if (data & 0x80) releaseLine(PIN_SDA); else pullLow(PIN_SDA);
-    delayMicroseconds(5); releaseLine(PIN_SCL); delayMicroseconds(5);
-    pullLow(PIN_SCL); data <<= 1;
+    if (data & 0x80) i2cRelease(SERVO_SDA_PIN); else i2cLow(SERVO_SDA_PIN);
+    i2cDelay();
+    i2cRelease(SERVO_SCL_PIN);
+    i2cDelay();
+    i2cLow(SERVO_SCL_PIN);
+    data <<= 1;
   }
-  releaseLine(PIN_SDA); delayMicroseconds(5); releaseLine(PIN_SCL);
-  delayMicroseconds(5);
-  bool ack = (digitalRead(PIN_SDA) == LOW);
-  pullLow(PIN_SCL);
+  i2cRelease(SERVO_SDA_PIN);
+  i2cDelay();
+  i2cRelease(SERVO_SCL_PIN);
+  i2cDelay();
+  bool ack = (digitalRead(SERVO_SDA_PIN) == LOW);
+  i2cLow(SERVO_SCL_PIN);
   return ack;
 }
 
+// ==================== PCA9685 ====================
 static bool pcaWriteRegister(byte reg, byte value) {
   i2cStart();
-  bool ok = i2cSendByte(PCA_ADDR << 1);
-  if (ok) ok = i2cSendByte(reg);
-  if (ok) ok = i2cSendByte(value);
+  bool ok = i2cWriteByte(PCA9685_ADDR << 1);
+  if (ok) ok = i2cWriteByte(reg);
+  if (ok) ok = i2cWriteByte(value);
   i2cStop();
   return ok;
 }
 
+// Puts the PCA9685 in sleep, sets the prescaler (about 50 Hz for servos),
+// wakes it up and enables register auto-increment.
 static bool pcaConfigure() {
-  if (!pcaWriteRegister(0x00, 0x10)) return false;   // sleep
-  if (!pcaWriteRegister(0xFE, 121)) return false;    // prescaler (~50 Hz)
+  if (!pcaWriteRegister(0x00, 0x10)) return false;  // MODE1: sleep
+  if (!pcaWriteRegister(0xFE, 121)) return false;   // PRESCALE: 50 Hz
   delay(5);
-  if (!pcaWriteRegister(0x00, 0x20)) return false;   // wake, auto-increment
+  if (!pcaWriteRegister(0x00, 0x20)) return false;  // MODE1: wake, auto-increment
   delay(5);
-  if (!pcaWriteRegister(0x00, 0xA0)) return false;   // restart
+  if (!pcaWriteRegister(0x00, 0xA0)) return false;  // MODE1: restart
   delay(10);
   return true;
 }
 
-bool servoAvailable() { return available; }
-
-bool servoMove(int angle) {
-  if (!available) {
-    Serial.println(F("[SERVO] Not available, move skipped"));
-    return false;
-  }
-
-  angle = constrain(angle, 0, 180);
-  int pulse = map(angle, 0, 180, 123, 492);
-  byte reg = 0x06 + 4 * SERVO_CHANNEL;
-
-  bool ok = pcaWriteRegister(reg, 0);
-  if (ok) ok = pcaWriteRegister(reg + 1, 0);
-  if (ok) ok = pcaWriteRegister(reg + 2, pulse & 0xFF);
-  if (ok) ok = pcaWriteRegister(reg + 3, pulse >> 8);
-
-  Serial.print(F("[SERVO] Move to "));
-  Serial.print(angle);
-  Serial.println(ok ? F(" deg OK") : F(" deg FAILED"));
-  return ok;
-}
-
-void servoInit() {
-  releaseLine(PIN_SDA);
-  releaseLine(PIN_SCL);
+// ==================== PUBLIC API ====================
+bool servoInit() {
+  i2cRelease(SERVO_SDA_PIN);
+  i2cRelease(SERVO_SCL_PIN);
   delay(100);
 
   i2cStart();
-  bool detected = i2cSendByte(PCA_ADDR << 1);
+  bool detected = i2cWriteByte(PCA9685_ADDR << 1);
   i2cStop();
 
-  if (detected && pcaConfigure()) {
-    available = true;
-    Serial.println(F("[SERVO] PCA9685 detected, servo on channel 0"));
-    servoMove(SERVO_OPEN_ANGLE);
-  } else {
-    Serial.println(F("[SERVO] WARNING: PCA9685 not detected, route will run without servo"));
-  }
+  servoReady = detected && pcaConfigure();
+  return servoReady;
+}
+
+bool servoIsAvailable() {
+  return servoReady;
+}
+
+bool servoMove(int angle) {
+  if (!servoReady) return false;
+
+  angle = constrain(angle, 0, 180);
+  // 123..492 ticks of the 4096-step PWM cycle correspond to 0..180 degrees.
+  // Tune these two numbers if your servo range does not match.
+  int pulse = map(angle, 0, 180, 123, 492);
+
+  byte reg = 0x06 + 4 * SERVO_CHANNEL;  // LEDn_ON_L
+  if (!pcaWriteRegister(reg, 0)) return false;               // ON low
+  if (!pcaWriteRegister(reg + 1, 0)) return false;           // ON high
+  if (!pcaWriteRegister(reg + 2, pulse & 0xFF)) return false;  // OFF low
+  if (!pcaWriteRegister(reg + 3, pulse >> 8)) return false;    // OFF high
+  return true;
 }

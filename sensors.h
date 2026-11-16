@@ -1,12 +1,23 @@
-#pragma once
+#ifndef SENSORS_H
+#define SENSORS_H
+
 #include <Arduino.h>
 
-enum LimitId : uint8_t { LIMIT_X, LIMIT_Y, LIMIT_A, LIMIT_Z, LIMIT_COUNT };
+// ==================== LIMIT SWITCH PINS ====================
+#define LIMIT_X_PIN 11
+#define LIMIT_Y_PIN 10
+#define LIMIT_A_PIN A2
+#define LIMIT_Z_PIN A3
 
-// Level read when a switch is triggered (NC wiring + internal pull-up -> HIGH)
-#define LIMIT_ACTIVE_LEVEL HIGH
+// Logic level that means "switch activated".
+// Pins use INPUT_PULLUP and the original wiring reports HIGH when activated.
+// Change to LOW if you rewire the switches as normally-open to GND.
+const uint8_t LIMIT_ACTIVE_LEVEL = HIGH;
 
+// Configures all limit switch pins.
 void sensorsInit();
-void sensorsUpdate();              // logs state changes, call every loop()
-bool limitActive(LimitId id);
-void sensorsPrintStatus();
+
+// Returns true if the limit switch connected to `pin` is activated.
+bool sensorsLimitActive(uint8_t pin);
+
+#endif

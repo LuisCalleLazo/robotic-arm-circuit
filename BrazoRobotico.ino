@@ -1,6 +1,7 @@
 #include "motors.h"
 #include "sensors.h"
 #include "servo.h"
+#include "z_axis.h"
 
 // ==================== SERIAL PROTOCOL (FOR THE HMI) ====================
 // Every line sent by the Arduino is CSV: TAG,field,field,...
@@ -104,10 +105,11 @@ void logState() {
 void logPosition() {
   Serial.print(F("POS"));
   for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+    AxisId id = (AxisId)i;
     Serial.print(',');
-    Serial.print(motorsName((AxisId)i));
+    Serial.print(motorsName(id));
     Serial.print('=');
-    Serial.print(motorsPosition((AxisId)i));
+    Serial.print(id == AXIS_Z ? zAxisPosition() : motorsPosition(id));
   }
   Serial.println();
 }
@@ -156,7 +158,8 @@ void streamPosition() {
 // Starts the homing search of one axis.
 // Returns true if a search started, false if the limit was already active.
 bool beginHoming(AxisId id) {
-  if (motorsHomingStart(id)) {
+  bool started = id == AXIS_Z ? zAxisBeginHoming() : motorsHomingStart(id);
+  if (started) {
     logAxisEvent(F("HOMING_START"), id, 0);
     setState(ST_HOMING);
     return true;
@@ -170,14 +173,20 @@ void setPoseTargets(const Pose &p) {
   motorsMoveTo(AXIS_X, p.x);
   motorsMoveTo(AXIS_Y, p.y);
   motorsMoveTo(AXIS_A, p.a);
-  motorsMoveTo(AXIS_Z, p.z);
+  zAxisMoveTo(p.z);
+}
+
+bool runAllAxes() {
+  bool otherAxesRunning = motorsRunAll();
+  MoveStatus zStatus = zAxisRun();
+  return otherAxesRunning || zStatus == MOVE_RUNNING;
 }
 
 // Moves X, Y and Z to the home pose first; A moves later (see ST_WAIT_BEFORE_A).
 void goToHomePose() {
   motorsMoveTo(AXIS_X, HOME_POSE.x);
   motorsMoveTo(AXIS_Y, HOME_POSE.y);
-  motorsMoveTo(AXIS_Z, HOME_POSE.z);
+  zAxisMoveTo(HOME_POSE.z);
   logEvent(F("HOME_POSE_START"));
   setState(ST_GOTO_HOME_POSE);
 }
@@ -214,7 +223,7 @@ void startRouteStep() {
 }
 
 void startRoute() {
-  if (state != ST_IDLE || !motorsAllReferenced()) {
+  if (state != ST_IDLE || !motorsAllReferenced() || !zAxisIsReferenced()) {
     logError(F("NOT_READY"));
     return;
   }
@@ -225,6 +234,7 @@ void startRoute() {
 
 void stopAll() {
   motorsStopAll();
+  zAxisStop();
   autoHoming = false;
   logEvent(F("STOPPED"));
   setState(ST_IDLE);
@@ -299,16 +309,19 @@ void processCommand(char *raw) {
   // Letter plus number: move that axis.
   if (!onlyDigits(cmd + 1)) { logError(F("BAD_FORMAT")); return; }
 
-  switch (motorsMoveTo(id, atol(cmd + 1))) {
+  MoveStart moveResult = id == AXIS_Z
+    ? zAxisMoveTo(atol(cmd + 1))
+    : motorsMoveTo(id, atol(cmd + 1));
+  switch (moveResult) {
     case MOVE_NOT_REFERENCED:
       logAxisError(F("NOT_REFERENCED"), id);
       break;
     case MOVE_ALREADY_THERE:
-      logAxisEvent(F("MOVE_DONE"), id, motorsPosition(id));
+      logAxisEvent(F("MOVE_DONE"), id, id == AXIS_Z ? zAxisPosition() : motorsPosition(id));
       break;
     case MOVE_STARTED:
       activeAxis = id;
-      logAxisEvent(F("MOVE_START"), id, motorsTarget(id));
+      logAxisEvent(F("MOVE_START"), id, id == AXIS_Z ? zAxisTarget() : motorsTarget(id));
       setState(ST_MOVING_AXIS);
       break;
   }
@@ -347,9 +360,14 @@ void updateStateMachine() {
   switch (state) {
 
     case ST_HOMING: {
-      HomingStatus status = motorsHomingUpdate(activeAxis);
+      HomingStatus status = activeAxis == AXIS_Z
+        ? zAxisUpdateHoming()
+        : motorsHomingUpdate(activeAxis);
       if (status == HOMING_DONE) {
-        logAxisEvent(F("HOMING_DONE"), activeAxis, motorsSearchSteps(activeAxis));
+        long searched = activeAxis == AXIS_Z
+          ? zAxisSearchSteps()
+          : motorsSearchSteps(activeAxis);
+        logAxisEvent(F("HOMING_DONE"), activeAxis, searched);
         if (autoHoming) {
           homingIndex++;
           continueAutoHoming();
@@ -365,9 +383,14 @@ void updateStateMachine() {
     }
 
     case ST_MOVING_AXIS: {
-      MoveStatus status = motorsRunAxis(activeAxis);
+      MoveStatus status = activeAxis == AXIS_Z
+        ? zAxisRun()
+        : motorsRunAxis(activeAxis);
       if (status == MOVE_DONE) {
-        logAxisEvent(F("MOVE_DONE"), activeAxis, motorsPosition(activeAxis));
+        long position = activeAxis == AXIS_Z
+          ? zAxisPosition()
+          : motorsPosition(activeAxis);
+        logAxisEvent(F("MOVE_DONE"), activeAxis, position);
         setState(ST_IDLE);
       } else if (status == MOVE_LIMIT_HIT) {
         logAxisEvent(F("LIMIT_HIT"), activeAxis, 0);
@@ -377,7 +400,7 @@ void updateStateMachine() {
     }
 
     case ST_GOTO_HOME_POSE:
-      if (!motorsRunAll()) {
+      if (!runAllAxes()) {
         waitStart = millis();
         setState(ST_WAIT_BEFORE_A);
       }
@@ -399,7 +422,7 @@ void updateStateMachine() {
       break;
 
     case ST_ROUTE_MOVING:
-      if (!motorsRunAll()) {
+      if (!runAllAxes()) {
         applyServo(ROUTE[routeStep].servoAngle);
         logPosition();
         waitStart = millis();
@@ -432,6 +455,7 @@ void setup() {
 
   sensorsInit();
   motorsInit();
+  zAxisInit();
 
   if (servoInit()) {
     logEvent(F("SERVO_READY"));

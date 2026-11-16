@@ -13,12 +13,15 @@
 //                Higher acceleration = reaches the top speed sooner and
 //                short moves (like A) also get fast. Lower = softer start.
 //
-// How movement works (why it is fast and smooth now):
+// X, Y and A use the lightweight custom ramp below. Z uses AccelStepper at
+// constant speed for both homing and normal travel.
+//
+// Custom-ramp movement:
 //  - Steps are generated at a constant rate between ramp updates, exactly
 //    like the homing search (cheap, no floating point per step).
 //  - The speed ramp (trapezoid) is recomputed only every RAMP_UPDATE_US,
-//    not on every step. This keeps the main loop fast so four axes can run
-//    together without irregular pulses.
+//    not on every step. This keeps the main loop fast while the other axes
+//    run alongside Z.
 //
 // Tuning guide:
 //  1. Raise MOVE_SPEED_x by 1000 at a time until an axis starts losing
@@ -30,13 +33,12 @@
 const float HOMING_SPEED = 5000;
 
 const float MOVE_SPEED_X = 6000;
-const float MOVE_ACCEL_X = 15000;
+const float MOVE_ACCEL_X = 3000;
 const float MOVE_SPEED_Y = 6000;
 const float MOVE_ACCEL_Y = 15000;
 const float MOVE_SPEED_A = 6000;
 const float MOVE_ACCEL_A = 15000;
-const float MOVE_SPEED_Z = 6500;
-const float MOVE_ACCEL_Z = 3000;
+const float MOVE_SPEED_Z = HOMING_SPEED;
 
 // Ramp internals (normally you do not need to touch these).
 // RAMP_UPDATE_US  : how often the speed of every axis is recomputed.
@@ -82,8 +84,8 @@ enum MoveStart : uint8_t { MOVE_STARTED, MOVE_ALREADY_THERE, MOVE_NOT_REFERENCED
 enum MoveStatus : uint8_t { MOVE_RUNNING, MOVE_DONE, MOVE_LIMIT_HIT };
 
 // ==================== API ====================
-// All positions are "logical": 0 is the limit switch, positive moves away
-// from it, regardless of the physical motor direction of each axis.
+// Generic movement functions control X, Y and A. Z is controlled by z_axis.h.
+// Positions are logical: 0 is the limit switch and positive moves away from it.
 
 void motorsInit();
 
@@ -91,31 +93,31 @@ void motorsInit();
 char motorsName(AxisId id);
 bool motorsAxisFromChar(char c, AxisId *id);
 
-// Homing. Call motorsHomingStart() once, then motorsHomingUpdate() every loop
-// until it returns HOMING_DONE or HOMING_FAILED.
+// X/Y/A homing. Z homing is provided by zAxisBeginHoming()/zAxisUpdateHoming().
+// Call motorsHomingStart() once, then motorsHomingUpdate() each loop until it
+// returns HOMING_DONE or HOMING_FAILED.
 // motorsHomingStart() returns false if the limit was already active
 // (the axis is referenced immediately and no search is needed).
 bool motorsHomingStart(AxisId id);
 HomingStatus motorsHomingUpdate(AxisId id);
 long motorsSearchSteps(AxisId id);
 
-// Sets the target of one axis (clamped to its travel). Does not block.
+// Sets the target of one X/Y/A axis (clamped to its travel). Does not block.
 MoveStart motorsMoveTo(AxisId id, long target);
 
-// Generates the steps of one axis. For the Z axis it also stops when the
-// limit switch is hit while moving toward zero.
+// Generates steps of one X/Y/A axis.
 MoveStatus motorsRunAxis(AxisId id);
 
-// Generates the steps of all axes. Returns true while any axis is moving.
+// Generates steps of X/Y/A. Z must be advanced separately with zAxisRun().
 bool motorsRunAll();
 
-// State queries.
+// State queries for X/Y/A.
 long motorsPosition(AxisId id);
 long motorsTarget(AxisId id);
 bool motorsIsReferenced(AxisId id);
 bool motorsAllReferenced();
 
-// Stops immediately and clears all references (axes must be homed again).
+// Stops X/Y/A immediately and clears their references.
 void motorsStopAll();
 
 #endif

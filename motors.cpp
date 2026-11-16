@@ -1,8 +1,7 @@
 #include "motors.h"
 #include "sensors.h"
 
-// One entry per axis. Every function below works on this table, so the
-// X, Y, A and Z logic is written only once.
+// X, Y and A use the custom ramp. Z has its own controller in z_axis.cpp.
 //
 // sign: converts logical position to motor steps (motorSteps = sign * logical).
 //       -1 inverts the physical direction. Homing always moves toward the
@@ -47,7 +46,7 @@ static Axis axes[AXIS_COUNT] = {
   Axis(STEP_X_PIN, DIR_X_PIN, LIMIT_X_PIN, 'X', -1, MAX_TRAVEL_X, MOVE_SPEED_X, MOVE_ACCEL_X, false, true),
   Axis(STEP_Y_PIN, DIR_Y_PIN, LIMIT_Y_PIN, 'Y', -1, MAX_TRAVEL_Y, MOVE_SPEED_Y, MOVE_ACCEL_Y, false, true),
   Axis(STEP_A_PIN, DIR_A_PIN, LIMIT_A_PIN, 'A',  1, MAX_TRAVEL_A, MOVE_SPEED_A, MOVE_ACCEL_A, false, true),
-  Axis(STEP_Z_PIN, DIR_Z_PIN, LIMIT_Z_PIN, 'Z',  1, MAX_TRAVEL_Z, MOVE_SPEED_Z, MOVE_ACCEL_Z, true,  false)
+  Axis(STEP_Z_PIN, DIR_Z_PIN, LIMIT_Z_PIN, 'Z',  1, MAX_TRAVEL_Z, MOVE_SPEED_Z, 0, true, false)
 };
 
 // Time of the last ramp update (shared by all axes).
@@ -114,7 +113,7 @@ static void rampUpdate(Axis &a, float dt) {
   a.intervalUs = (unsigned long)(1000000.0f / v);
 }
 
-// Updates the ramp of all moving axes every RAMP_UPDATE_US.
+// Updates the custom ramp of X, Y and A every RAMP_UPDATE_US.
 static void rampTick() {
   unsigned long now = micros();
   unsigned long elapsed = now - lastRampUs;
@@ -144,7 +143,7 @@ static bool stepAxisMove(Axis &a) {
 
 // ==================== INIT AND LOOKUP ====================
 void motorsInit() {
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+  for (uint8_t i = 0; i < AXIS_Z; i++) {
     pinMode(axes[i].stepPin, OUTPUT);
     pinMode(axes[i].dirPin, OUTPUT);
     digitalWrite(axes[i].stepPin, LOW);
@@ -167,13 +166,13 @@ bool motorsAxisFromChar(char c, AxisId *id) {
 
 // ==================== HOMING ====================
 bool motorsHomingStart(AxisId id) {
+  if (id == AXIS_Z) return false;
   Axis &a = axes[id];
   clearMotion(a);
   a.referenced = false;
   a.searchSteps = 0;
   a.pos = 0;
   a.target = 0;
-
   if (sensorsLimitActive(a.limitPin)) {
     a.referenced = true;
     return false;
@@ -187,6 +186,7 @@ bool motorsHomingStart(AxisId id) {
 }
 
 HomingStatus motorsHomingUpdate(AxisId id) {
+  if (id == AXIS_Z) return HOMING_FAILED;
   Axis &a = axes[id];
 
   if (sensorsLimitActive(a.limitPin)) {
@@ -211,6 +211,7 @@ long motorsSearchSteps(AxisId id) {
 
 // ==================== MOVEMENT ====================
 MoveStart motorsMoveTo(AxisId id, long target) {
+  if (id == AXIS_Z) return MOVE_NOT_REFERENCED;
   Axis &a = axes[id];
   if (!a.referenced) return MOVE_NOT_REFERENCED;
 
@@ -232,6 +233,7 @@ MoveStart motorsMoveTo(AxisId id, long target) {
 }
 
 MoveStatus motorsRunAxis(AxisId id) {
+  if (id == AXIS_Z) return MOVE_DONE;
   Axis &a = axes[id];
 
   // Remaining logical distance < 0 means the axis is moving toward zero.
@@ -250,7 +252,7 @@ MoveStatus motorsRunAxis(AxisId id) {
 bool motorsRunAll() {
   rampTick();
   bool running = false;
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+  for (uint8_t i = 0; i < AXIS_Z; i++) {
     if (stepAxisMove(axes[i])) running = true;
   }
   return running;
@@ -258,19 +260,22 @@ bool motorsRunAll() {
 
 // ==================== QUERIES ====================
 long motorsPosition(AxisId id) {
+  if (id == AXIS_Z) return 0;
   return axes[id].sign * axes[id].pos;
 }
 
 long motorsTarget(AxisId id) {
+  if (id == AXIS_Z) return 0;
   return axes[id].sign * axes[id].target;
 }
 
 bool motorsIsReferenced(AxisId id) {
+  if (id == AXIS_Z) return false;
   return axes[id].referenced;
 }
 
 bool motorsAllReferenced() {
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+  for (uint8_t i = 0; i < AXIS_Z; i++) {
     if (!axes[i].referenced) return false;
   }
   return true;
@@ -278,7 +283,7 @@ bool motorsAllReferenced() {
 
 // ==================== STOP ====================
 void motorsStopAll() {
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
+  for (uint8_t i = 0; i < AXIS_Z; i++) {
     clearMotion(axes[i]);
     axes[i].target = axes[i].pos;
     axes[i].referenced = false;

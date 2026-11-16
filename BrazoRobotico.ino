@@ -1,7 +1,6 @@
 #include "motors.h"
 #include "sensors.h"
 #include "servo.h"
-#include "z_axis.h"
 
 // ==================== SERIAL PROTOCOL (FOR THE HMI) ====================
 // Every line sent by the Arduino is CSV: TAG,field,field,...
@@ -25,10 +24,8 @@
 const unsigned long DELAY_BEFORE_A_MS = 800;
 // Pause after each route pose is reached.
 const unsigned long DELAY_BETWEEN_POSES_MS = 2000;
-// Position streaming period while moving. Set to 0 to disable.
-// Keep it above ~150 ms so serial output does not disturb step timing.
+// Position stream period while axes other than Z are moving.
 const unsigned long POS_STREAM_INTERVAL_MS = 250;
-
 // ==================== POSES AND ROUTE ====================
 const int SERVO_NONE = -1;
 
@@ -109,7 +106,7 @@ void logPosition() {
     Serial.print(',');
     Serial.print(motorsName(id));
     Serial.print('=');
-    Serial.print(id == AXIS_Z ? zAxisPosition() : motorsPosition(id));
+    Serial.print(motorsPosition(id));
   }
   Serial.println();
 }
@@ -145,9 +142,10 @@ bool isMovingState() {
          state == ST_MOVING_A || state == ST_ROUTE_MOVING;
 }
 
-// Streams positions while an axis is moving so the HMI can animate.
+// Avoid serial output while Z is stepping so its timing matches homing.
 void streamPosition() {
   if (POS_STREAM_INTERVAL_MS == 0 || !isMovingState()) return;
+  if (motorsPosition(AXIS_Z) != motorsTarget(AXIS_Z)) return;
   if (millis() - lastPosLog >= POS_STREAM_INTERVAL_MS) {
     lastPosLog = millis();
     logPosition();
@@ -158,8 +156,7 @@ void streamPosition() {
 // Starts the homing search of one axis.
 // Returns true if a search started, false if the limit was already active.
 bool beginHoming(AxisId id) {
-  bool started = id == AXIS_Z ? zAxisBeginHoming() : motorsHomingStart(id);
-  if (started) {
+  if (motorsHomingStart(id)) {
     logAxisEvent(F("HOMING_START"), id, 0);
     setState(ST_HOMING);
     return true;
@@ -168,25 +165,19 @@ bool beginHoming(AxisId id) {
   return false;
 }
 
-// Sets the X, Y, A and Z targets of a pose. Start of a simultaneous move.
+// Sets the targets of all axes for a simultaneous move.
 void setPoseTargets(const Pose &p) {
   motorsMoveTo(AXIS_X, p.x);
   motorsMoveTo(AXIS_Y, p.y);
   motorsMoveTo(AXIS_A, p.a);
-  zAxisMoveTo(p.z);
-}
-
-bool runAllAxes() {
-  bool otherAxesRunning = motorsRunAll();
-  MoveStatus zStatus = zAxisRun();
-  return otherAxesRunning || zStatus == MOVE_RUNNING;
+  motorsMoveTo(AXIS_Z, p.z);
 }
 
 // Moves X, Y and Z to the home pose first; A moves later (see ST_WAIT_BEFORE_A).
 void goToHomePose() {
   motorsMoveTo(AXIS_X, HOME_POSE.x);
   motorsMoveTo(AXIS_Y, HOME_POSE.y);
-  zAxisMoveTo(HOME_POSE.z);
+  motorsMoveTo(AXIS_Z, HOME_POSE.z);
   logEvent(F("HOME_POSE_START"));
   setState(ST_GOTO_HOME_POSE);
 }
@@ -223,7 +214,7 @@ void startRouteStep() {
 }
 
 void startRoute() {
-  if (state != ST_IDLE || !motorsAllReferenced() || !zAxisIsReferenced()) {
+  if (state != ST_IDLE || !motorsAllReferenced()) {
     logError(F("NOT_READY"));
     return;
   }
@@ -234,7 +225,6 @@ void startRoute() {
 
 void stopAll() {
   motorsStopAll();
-  zAxisStop();
   autoHoming = false;
   logEvent(F("STOPPED"));
   setState(ST_IDLE);
@@ -309,19 +299,16 @@ void processCommand(char *raw) {
   // Letter plus number: move that axis.
   if (!onlyDigits(cmd + 1)) { logError(F("BAD_FORMAT")); return; }
 
-  MoveStart moveResult = id == AXIS_Z
-    ? zAxisMoveTo(atol(cmd + 1))
-    : motorsMoveTo(id, atol(cmd + 1));
-  switch (moveResult) {
+  switch (motorsMoveTo(id, atol(cmd + 1))) {
     case MOVE_NOT_REFERENCED:
       logAxisError(F("NOT_REFERENCED"), id);
       break;
     case MOVE_ALREADY_THERE:
-      logAxisEvent(F("MOVE_DONE"), id, id == AXIS_Z ? zAxisPosition() : motorsPosition(id));
+      logAxisEvent(F("MOVE_DONE"), id, motorsPosition(id));
       break;
     case MOVE_STARTED:
       activeAxis = id;
-      logAxisEvent(F("MOVE_START"), id, id == AXIS_Z ? zAxisTarget() : motorsTarget(id));
+      logAxisEvent(F("MOVE_START"), id, motorsTarget(id));
       setState(ST_MOVING_AXIS);
       break;
   }
@@ -360,14 +347,9 @@ void updateStateMachine() {
   switch (state) {
 
     case ST_HOMING: {
-      HomingStatus status = activeAxis == AXIS_Z
-        ? zAxisUpdateHoming()
-        : motorsHomingUpdate(activeAxis);
+      HomingStatus status = motorsHomingUpdate(activeAxis);
       if (status == HOMING_DONE) {
-        long searched = activeAxis == AXIS_Z
-          ? zAxisSearchSteps()
-          : motorsSearchSteps(activeAxis);
-        logAxisEvent(F("HOMING_DONE"), activeAxis, searched);
+        logAxisEvent(F("HOMING_DONE"), activeAxis, motorsSearchSteps(activeAxis));
         if (autoHoming) {
           homingIndex++;
           continueAutoHoming();
@@ -383,14 +365,9 @@ void updateStateMachine() {
     }
 
     case ST_MOVING_AXIS: {
-      MoveStatus status = activeAxis == AXIS_Z
-        ? zAxisRun()
-        : motorsRunAxis(activeAxis);
+      MoveStatus status = motorsRunAxis(activeAxis);
       if (status == MOVE_DONE) {
-        long position = activeAxis == AXIS_Z
-          ? zAxisPosition()
-          : motorsPosition(activeAxis);
-        logAxisEvent(F("MOVE_DONE"), activeAxis, position);
+        logAxisEvent(F("MOVE_DONE"), activeAxis, motorsPosition(activeAxis));
         setState(ST_IDLE);
       } else if (status == MOVE_LIMIT_HIT) {
         logAxisEvent(F("LIMIT_HIT"), activeAxis, 0);
@@ -400,7 +377,7 @@ void updateStateMachine() {
     }
 
     case ST_GOTO_HOME_POSE:
-      if (!runAllAxes()) {
+      if (!motorsRunAll()) {
         waitStart = millis();
         setState(ST_WAIT_BEFORE_A);
       }
@@ -422,7 +399,7 @@ void updateStateMachine() {
       break;
 
     case ST_ROUTE_MOVING:
-      if (!runAllAxes()) {
+      if (!motorsRunAll()) {
         applyServo(ROUTE[routeStep].servoAngle);
         logPosition();
         waitStart = millis();
@@ -455,7 +432,6 @@ void setup() {
 
   sensorsInit();
   motorsInit();
-  zAxisInit();
 
   if (servoInit()) {
     logEvent(F("SERVO_READY"));
@@ -465,7 +441,7 @@ void setup() {
   }
 
   Serial.println(F("INFO,SCARA X Y A Z"));
-  Serial.println(F("INFO,Commands: X Y A Z | X500 | R | P | POS"));
+  Serial.println(F("INFO,Commands: X/Y/A/Z home | X500 | R/START/INICIAR | P/STOP | POS/?"));
 
   startAutoHoming();
 }

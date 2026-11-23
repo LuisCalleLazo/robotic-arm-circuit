@@ -1,26 +1,16 @@
-#ifndef SERVO_H
-#define SERVO_H
-
+#pragma once
 #include <Arduino.h>
 
-// ==================== PCA9685 (SOFTWARE I2C) ====================
-#define SERVO_SCL_PIN A0
-#define SERVO_SDA_PIN A1
-#define PCA9685_ADDR 0x40
-#define SERVO_CHANNEL 0
-
-// Gripper angles. Adjust here to change how far the servo opens or closes.
-const int SERVO_OPEN_ANGLE = 0;
-const int SERVO_CLOSED_ANGLE = 140;
-
-// Detects and configures the PCA9685. Returns true on success.
-bool servoInit();
-
-// True if the PCA9685 was detected during servoInit().
-bool servoIsAvailable();
-
-// Moves the servo to `angle` (0..180). Returns false if the board is
-// missing or an I2C transfer was not acknowledged.
-bool servoMove(int angle);
-
+#ifndef PREFIJO
+#define PREFIJO "BC"
 #endif
+
+void servoConfigurar(int minAngulo, int maxAngulo, int velMaxima, int velDefecto);   // llamar antes de servoInit
+bool servoInit(byte pinSCL, byte pinSDA, byte direccion, byte canal, const char* key);
+bool servoMover(int angulo, int gradosPorSeg = -1);   // absoluto 0..180; vel propia (-1 = la global, 0 = la maxima permitida)
+void servoActualizar();                     // llamar en cada loop()
+void servoParar();
+void servoPausa(bool pausa);
+void servoVelocidad(int gradosPorSeg);      // 0 = la maxima permitida
+int  servoVelocidadActual();
+int  servoAngulo();

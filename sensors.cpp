@@ -1,12 +1,21 @@
 #include "sensors.h"
 
-void sensorsInit() {
-  pinMode(LIMIT_X_PIN, INPUT_PULLUP);
-  pinMode(LIMIT_Y_PIN, INPUT_PULLUP);
-  pinMode(LIMIT_A_PIN, INPUT_PULLUP);
-  pinMode(LIMIT_Z_PIN, INPUT_PULLUP);
+static const byte* pines;
+static const int*  hacia;
+static byte nivel;
+
+void sensoresInit(const byte* pinesLimite, const int* haciaSensor, byte nivelActivo, byte cantidad) {
+  pines = pinesLimite;
+  hacia = haciaSensor;
+  nivel = nivelActivo;
+  for (byte i = 0; i < cantidad; i++) pinMode(pines[i], INPUT_PULLUP);
 }
 
-bool sensorsLimitActive(uint8_t pin) {
-  return digitalRead(pin) == LIMIT_ACTIVE_LEVEL;
+bool sensorActivo(byte m) {
+  return digitalRead(pines[m]) == nivel;
+}
+
+// Solo bloquea si el motor avanza HACIA el sensor; alejarse siempre se permite
+bool sensorBloquea(byte m, int sentido) {
+  return sentido == hacia[m] && sensorActivo(m);
 }

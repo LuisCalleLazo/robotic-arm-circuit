@@ -2,452 +2,187 @@
 #include "sensors.h"
 #include "servo.h"
 
-// ==================== SERIAL PROTOCOL (FOR THE HMI) ====================
-// Every line sent by the Arduino is CSV: TAG,field,field,...
-//
-//   STATE,<name>                     state machine changed state
-//   EVT,<name>[,<axis>,<value>]      event (homing, moves, route, servo)
-//   POS,X=<n>,Y=<n>,A=<n>,Z=<n>      current logical positions in steps
-//   ERR,<code>[,<axis>]              error
-//   CMD,<text>                       echo of the command received
-//   INFO,<text>                      free text
-//
-// Commands accepted (newline terminated, case and spaces ignored):
-//   X | Y | A | Z     home that axis
-//   X500 | Y200 ...   move that axis to the given step position
-//   R | START | INICIAR   run the route (all axes must be homed)
-//   P | STOP              stop everything (axes must be homed again)
-//   ? | POS | POSICION    print state and positions
+// =====================================================================
+//                        CONFIGURACION (EDITAR AQUI)
+// =====================================================================
 
-// ==================== TIMING CONFIGURATION ====================
-// Pause after X, Y and Z reach the home pose and before A moves.
-const unsigned long DELAY_BEFORE_A_MS = 800;
-// Pause after each route pose is reached.
-const unsigned long DELAY_BETWEEN_POSES_MS = 2000;
-// Position stream period while axes other than Z are moving.
-const unsigned long POS_STREAM_INTERVAL_MS = 250;
-// ==================== POSES AND ROUTE ====================
-const int SERVO_NONE = -1;
+// ---- KEYS de movimiento (pueden tener N caracteres) ----
+//                                      X      Y      A      Z
+const char* const KEY_MOTOR[NUM_MOTORES] = {"BCX", "BCY", "BCA", "BCZ"};
+const char* const KEY_SERVO     = "BCS";      // BCS120:30 -> servo a 120 grados a 30 grados/seg
 
-struct Pose {
-  long x, y, a, z;
-  int servoAngle;  // moved when the pose is reached, SERVO_NONE to skip
-};
+// ---- KEYS de control ----
+const char* const KEY_STOP      = "BCSTOP";   // para todo y cancela lo pendiente
+const char* const KEY_PAUSE     = "BCPAUSE";  // congela todo, conserva lo pendiente
+const char* const KEY_PLAY      = "BCPLAY";   // continua tras PAUSE
+const char* const KEY_ESTADO    = "BC?";      // pide estado y posiciones
+const char* const KEY_VEL       = "BCV";      // BCV7000  -> pasos/seg por defecto de los motores
+const char* const KEY_VEL_SERVO = "BCVS";     // BCVS90   -> grados/seg por defecto del servo (0 = maxima permitida)
 
-// Pose reached after homing and after the route ends.
-const Pose HOME_POSE = { 8000, 5500, 1200, 0, SERVO_NONE };
+// ---- Pines motores (X, Y, A, Z) ----
+const byte STEP_PIN[NUM_MOTORES]  = {2, 3, 4, 12};
+const byte DIR_PIN[NUM_MOTORES]   = {5, 6, 7, 13};
 
-// Route executed by R / START. Edit this table to change the sequence.
-const Pose ROUTE[] = {
-  //  X      Y     A     Z      servo on arrival
-  {  8000, 5500, 1200, 41000, SERVO_CLOSED_ANGLE },  // 1   : pick
-  {  8000, 5500, 1200,     0, SERVO_NONE },          // 1.1 : lift
-  { 16000, 5500, 1200,     0, SERVO_NONE },          // 1.2 : travel
-  { 16000, 5500, 1200, 41000, SERVO_OPEN_ANGLE },    // 1.3 : place
-  { 16000, 5500, 1200,     0, SERVO_NONE }           // 1.4 : lift
-};
-const uint8_t ROUTE_LENGTH = sizeof(ROUTE) / sizeof(ROUTE[0]);
+// ---- Sensores de limite (X, Y, A, Z) ----
+const byte LIMIT_PIN[NUM_MOTORES] = {11, 10, A2, A3};
+// Sentido que va HACIA el sensor: +1 pasos positivos, -1 pasos negativos
+const int  HACIA_SENSOR[NUM_MOTORES] = {+1, +1, -1, -1};
+const byte NIVEL_ACTIVO = HIGH;               // nivel que lee el sensor al chocar
 
-// Homing order at power on.
-const AxisId HOMING_ORDER[AXIS_COUNT] = { AXIS_Z, AXIS_X, AXIS_A, AXIS_Y };
+// ---- Servo PCA9685 (I2C por software) ----
+const byte PIN_SCL = A0;
+const byte PIN_SDA = A1;
+const byte PCA_ADDR = 0x40;
+const byte CANAL_SERVO = 0;
 
-// ==================== STATE MACHINE ====================
-enum State : uint8_t {
-  ST_IDLE,
-  ST_HOMING,
-  ST_MOVING_AXIS,
-  ST_GOTO_HOME_POSE,
-  ST_WAIT_BEFORE_A,
-  ST_MOVING_A,
-  ST_ROUTE_MOVING,
-  ST_ROUTE_WAIT,
-  ST_ERROR
-};
+// ---- Seguridad del servo (PDI-6221MG-180) ----
+const int SERVO_MIN = 0;          // limite minimo en grados (sube a ~5 si topa mecanicamente)
+const int SERVO_MAX = 180;        // limite maximo en grados
+const int SERVO_VEL_MAX = 180;    // grados/seg maximos permitidos (BCS..:0 y BCVS0 usan este valor)
+const int SERVO_VEL_DEF = 60;     // grados/seg cuando no se indica velocidad
 
-State state = ST_IDLE;
-AxisId activeAxis = AXIS_X;
-bool autoHoming = false;
-uint8_t homingIndex = 0;
-uint8_t routeStep = 0;
-unsigned long waitStart = 0;
-unsigned long lastPosLog = 0;
+// =====================================================================
 
-// ==================== LOGGING ====================
-const __FlashStringHelper *stateName(State s) {
-  switch (s) {
-    case ST_IDLE:           return F("IDLE");
-    case ST_HOMING:         return F("HOMING");
-    case ST_MOVING_AXIS:    return F("MOVING_AXIS");
-    case ST_GOTO_HOME_POSE: return F("GOTO_HOME_POSE");
-    case ST_WAIT_BEFORE_A:  return F("WAIT_BEFORE_A");
-    case ST_MOVING_A:       return F("MOVING_A");
-    case ST_ROUTE_MOVING:   return F("ROUTE_MOVING");
-    case ST_ROUTE_WAIT:     return F("ROUTE_WAIT");
-    default:                return F("ERROR");
-  }
-}
+bool pausado = false;
 
-void setState(State s) {
-  if (s == state) return;
-  state = s;
-  Serial.print(F("STATE,"));
-  Serial.println(stateName(s));
-}
-
-void logState() {
-  Serial.print(F("STATE,"));
-  Serial.println(stateName(state));
-}
-
-void logPosition() {
-  Serial.print(F("POS"));
-  for (uint8_t i = 0; i < AXIS_COUNT; i++) {
-    AxisId id = (AxisId)i;
-    Serial.print(',');
-    Serial.print(motorsName(id));
-    Serial.print('=');
-    Serial.print(motorsPosition(id));
-  }
-  Serial.println();
-}
-
-void logEvent(const __FlashStringHelper *name) {
-  Serial.print(F("EVT,"));
-  Serial.println(name);
-}
-
-void logAxisEvent(const __FlashStringHelper *name, AxisId id, long value) {
-  Serial.print(F("EVT,"));
-  Serial.print(name);
-  Serial.print(',');
-  Serial.print(motorsName(id));
-  Serial.print(',');
-  Serial.println(value);
-}
-
-void logError(const __FlashStringHelper *code) {
-  Serial.print(F("ERR,"));
-  Serial.println(code);
-}
-
-void logAxisError(const __FlashStringHelper *code, AxisId id) {
-  Serial.print(F("ERR,"));
-  Serial.print(code);
-  Serial.print(',');
-  Serial.println(motorsName(id));
-}
-
-bool isMovingState() {
-  return state == ST_MOVING_AXIS || state == ST_GOTO_HOME_POSE ||
-         state == ST_MOVING_A || state == ST_ROUTE_MOVING;
-}
-
-// Avoid serial output while Z is stepping so its timing matches homing.
-void streamPosition() {
-  if (POS_STREAM_INTERVAL_MS == 0 || !isMovingState()) return;
-  if (motorsPosition(AXIS_Z) != motorsTarget(AXIS_Z)) return;
-  if (millis() - lastPosLog >= POS_STREAM_INTERVAL_MS) {
-    lastPosLog = millis();
-    logPosition();
-  }
-}
-
-// ==================== ACTIONS ====================
-// Starts the homing search of one axis.
-// Returns true if a search started, false if the limit was already active.
-bool beginHoming(AxisId id) {
-  if (motorsHomingStart(id)) {
-    logAxisEvent(F("HOMING_START"), id, 0);
-    setState(ST_HOMING);
-    return true;
-  }
-  logAxisEvent(F("HOMING_DONE"), id, 0);
-  return false;
-}
-
-// Sets the targets of all axes for a simultaneous move.
-void setPoseTargets(const Pose &p) {
-  motorsMoveTo(AXIS_X, p.x);
-  motorsMoveTo(AXIS_Y, p.y);
-  motorsMoveTo(AXIS_A, p.a);
-  motorsMoveTo(AXIS_Z, p.z);
-}
-
-// Moves X, Y and Z to the home pose first; A moves later (see ST_WAIT_BEFORE_A).
-void goToHomePose() {
-  motorsMoveTo(AXIS_X, HOME_POSE.x);
-  motorsMoveTo(AXIS_Y, HOME_POSE.y);
-  motorsMoveTo(AXIS_Z, HOME_POSE.z);
-  logEvent(F("HOME_POSE_START"));
-  setState(ST_GOTO_HOME_POSE);
-}
-
-// Advances the automatic homing sequence to the next axis that needs a search.
-// When every axis is referenced it moves to the home pose.
-void continueAutoHoming() {
-  while (homingIndex < AXIS_COUNT) {
-    activeAxis = HOMING_ORDER[homingIndex];
-    if (beginHoming(activeAxis)) return;
-    homingIndex++;
-  }
-  autoHoming = false;
-  logEvent(F("HOMING_COMPLETE"));
-  goToHomePose();
-}
-
-void startAutoHoming() {
-  autoHoming = true;
-  homingIndex = 0;
-  continueAutoHoming();
-}
-
-void startRouteStep() {
-  if (routeStep >= ROUTE_LENGTH) {
-    logEvent(F("ROUTE_DONE"));
-    goToHomePose();
-    return;
-  }
-  setPoseTargets(ROUTE[routeStep]);
-  Serial.print(F("EVT,ROUTE_STEP,"));
-  Serial.println(routeStep);
-  setState(ST_ROUTE_MOVING);
-}
-
-void startRoute() {
-  if (state != ST_IDLE || !motorsAllReferenced()) {
-    logError(F("NOT_READY"));
-    return;
-  }
-  routeStep = 0;
-  logEvent(F("ROUTE_START"));
-  startRouteStep();
-}
-
-void stopAll() {
-  motorsStopAll();
-  autoHoming = false;
-  logEvent(F("STOPPED"));
-  setState(ST_IDLE);
-}
-
-// Runs the servo action of a pose and reports the result.
-void applyServo(int angle) {
-  if (angle == SERVO_NONE) return;
-  if (servoMove(angle)) {
-    Serial.print(F("EVT,SERVO,"));
-    Serial.println(angle);
-  } else {
-    logError(F("SERVO_FAILED"));
-  }
-}
-
-// ==================== COMMAND PARSER ====================
-bool onlyDigits(const char *s) {
-  if (*s == '\0') return false;
+bool numero(const char* s, long& v) {
+  bool neg = false;
+  if (*s == '-') { neg = true; s++; } else if (*s == '+') s++;
+  if (!*s) return false;
+  long r = 0; byte n = 0;
   while (*s) {
-    if (*s < '0' || *s > '9') return false;
-    s++;
+    if (*s < '0' || *s > '9' || ++n > 9) return false;
+    r = r * 10 + (*s - '0'); s++;
   }
+  v = neg ? -r : r;
   return true;
 }
 
-void processCommand(char *raw) {
-  // Remove spaces, tabs and '=', convert to upper case.
-  char cmd[20];
-  byte n = 0;
-  for (byte i = 0; raw[i] && n < sizeof(cmd) - 1; i++) {
-    char ch = raw[i];
-    if (ch == ' ' || ch == '\t' || ch == '=') continue;
-    if (ch >= 'a' && ch <= 'z') ch -= 32;
-    cmd[n++] = ch;
-  }
-  cmd[n] = '\0';
-  if (!n) return;
-
-  Serial.print(F("CMD,"));
-  Serial.println(cmd);
-
-  if (!strcmp(cmd, "?") || !strcmp(cmd, "POS") || !strcmp(cmd, "POSICION")) {
-    logState();
-    logPosition();
-    return;
-  }
-
-  // Same as the original: after a homing error nothing else is accepted
-  // until the board is reset.
-  if (state == ST_ERROR) { logError(F("RESET_REQUIRED")); return; }
-
-  if (!strcmp(cmd, "P") || !strcmp(cmd, "STOP")) { stopAll(); return; }
-  if (!strcmp(cmd, "R") || !strcmp(cmd, "START") || !strcmp(cmd, "INICIAR")) {
-    startRoute();
-    return;
-  }
-
-  if (state != ST_IDLE) { logError(F("BUSY")); return; }
-
-  AxisId id;
-  if (!motorsAxisFromChar(cmd[0], &id)) { logError(F("UNKNOWN_COMMAND")); return; }
-
-  // Single letter: home that axis.
-  if (cmd[1] == '\0') {
-    autoHoming = false;
-    activeAxis = id;
-    beginHoming(id);
-    return;
-  }
-
-  // Letter plus number: move that axis.
-  if (!onlyDigits(cmd + 1)) { logError(F("BAD_FORMAT")); return; }
-
-  switch (motorsMoveTo(id, atol(cmd + 1))) {
-    case MOVE_NOT_REFERENCED:
-      logAxisError(F("NOT_REFERENCED"), id);
-      break;
-    case MOVE_ALREADY_THERE:
-      logAxisEvent(F("MOVE_DONE"), id, motorsPosition(id));
-      break;
-    case MOVE_STARTED:
-      activeAxis = id;
-      logAxisEvent(F("MOVE_START"), id, motorsTarget(id));
-      setState(ST_MOVING_AXIS);
-      break;
-  }
+// true si 'tok' = key + numero
+bool conKey(const char* tok, const char* key, long& v) {
+  size_t k = strlen(key);
+  if (strncmp(tok, key, k) != 0) return false;
+  return numero(tok + k, v);
 }
 
-// ==================== SERIAL READER ====================
-// A command ends with a newline, or after TIME_END_COMMAND_MS without new
-// characters (useful when the terminal does not send a line ending).
-char serialBuffer[20];
-byte serialIndex = 0;
-unsigned long lastSerialChar = 0;
-const unsigned long TIME_END_COMMAND_MS = 120;
+void evtSimple(const __FlashStringHelper* tipo) {
+  Serial.print(PREFIJO); Serial.print(F(",EVT,")); Serial.println(tipo);
+}
 
-void readSerial() {
+void cfg(const __FlashStringHelper* nombre, long valor) {
+  Serial.print(PREFIJO); Serial.print(F(",CFG,")); Serial.print(nombre);
+  Serial.print(','); Serial.println(valor);
+}
+
+void detener() {
+  motoresParar();
+  servoParar();
+  pausado = false;
+  evtSimple(F("STOP"));
+}
+
+void pausar(bool p) {
+  pausado = p;
+  motoresPausa(p);
+  servoPausa(p);
+  evtSimple(p ? F("PAUSE") : F("PLAY"));
+}
+
+void estado() {
+  Serial.print(PREFIJO); Serial.print(F(",STATUS,PAUSA=")); Serial.print(pausado ? 1 : 0);
+  Serial.print(F(",VEL=")); Serial.print(motoresVelocidadActual());
+  Serial.print(F(",VELS=")); Serial.println(servoVelocidadActual());
+  for (byte i = 0; i < NUM_MOTORES; i++) {
+    Serial.print(KEY_MOTOR[i]); Serial.print('='); Serial.println(motorPos(i));
+  }
+  Serial.print(KEY_SERVO); Serial.print('='); Serial.println(servoAngulo());
+}
+
+// Una linea puede traer varios tokens separados por espacio: se arrancan todos a la vez
+//   BCX500:2000 BCY-300 BCS120:30
+void procesarLinea(char* linea) {
+  long pasos[NUM_MOTORES], velMotor[NUM_MOTORES];
+  bool hay[NUM_MOTORES];
+  for (byte i = 0; i < NUM_MOTORES; i++) { hay[i] = false; velMotor[i] = -1; }
+  long angulo = 0, velServo = -1; bool hayServo = false;
+
+  char* ctx;
+  for (char* tok = strtok_r(linea, " ,;\t", &ctx); tok; tok = strtok_r(NULL, " ,;\t", &ctx)) {
+    long v;
+    if (!strcmp(tok, KEY_STOP))   { detener(); return; }
+    if (!strcmp(tok, KEY_PAUSE))  { pausar(true); continue; }
+    if (!strcmp(tok, KEY_PLAY))   { pausar(false); continue; }
+    if (!strcmp(tok, KEY_ESTADO)) { estado(); continue; }
+
+    if (conKey(tok, KEY_VEL_SERVO, v)) { servoVelocidad(v); cfg(F("VELS"), servoVelocidadActual()); continue; }
+    if (conKey(tok, KEY_VEL, v))       { motoresVelocidad(v); cfg(F("VEL"), motoresVelocidadActual()); continue; }
+
+    // Velocidad propia del movimiento:  BCX500:2000   BCS120:30
+    long vel = -1;
+    char* dp = strchr(tok, ':');
+    if (dp) {
+      *dp = '\0';
+      if (!numero(dp + 1, vel) || vel < 0) {
+        Serial.print(PREFIJO); Serial.print(F(",ERR,BADSPEED,")); Serial.println(tok);
+        return;
+      }
+    }
+
+    if (conKey(tok, KEY_SERVO, v))     { angulo = constrain(v, 0L, 180L); velServo = vel; hayServo = true; continue; }
+
+    bool ok = false;
+    for (byte i = 0; i < NUM_MOTORES; i++) {
+      if (conKey(tok, KEY_MOTOR[i], v)) { pasos[i] = v; velMotor[i] = vel; hay[i] = true; ok = true; break; }
+    }
+    if (!ok) {
+      Serial.print(PREFIJO); Serial.print(F(",ERR,UNKNOWN,")); Serial.println(tok);
+      return;                                   // linea invalida: no se mueve nada
+    }
+  }
+
+  for (byte i = 0; i < NUM_MOTORES; i++) if (hay[i]) motorMover(i, pasos[i], velMotor[i] > 0 ? velMotor[i] : 0);
+  if (hayServo) servoMover((int)angulo, (int)velServo);
+}
+
+// ---- Lector serial sin String ----
+char buf[80];
+byte nbuf = 0;
+bool descartar = false;
+unsigned long tUltimoChar = 0;
+
+void leerSerial() {
   while (Serial.available() > 0) {
-    char ch = (char)Serial.read();
-    lastSerialChar = millis();
-    if (ch == '\r') continue;
-    if (ch == '\n') {
-      serialBuffer[serialIndex] = '\0';
-      processCommand(serialBuffer);
-      serialIndex = 0;
-    } else if (ch >= 32 && ch <= 126 && serialIndex < sizeof(serialBuffer) - 1) {
-      serialBuffer[serialIndex++] = ch;
+    char c = (char)Serial.read();
+    tUltimoChar = millis();
+    if (c == '\n' || c == '\r') {
+      if (!descartar && nbuf) { buf[nbuf] = '\0'; procesarLinea(buf); }
+      nbuf = 0; descartar = false;
+    } else if (nbuf < sizeof(buf) - 1) {
+      buf[nbuf++] = toupper(c);
+    } else if (!descartar) {
+      descartar = true;
+      Serial.print(PREFIJO); Serial.println(F(",ERR,LINEA_LARGA"));
     }
   }
-  if (serialIndex > 0 && millis() - lastSerialChar >= TIME_END_COMMAND_MS) {
-    serialBuffer[serialIndex] = '\0';
-    processCommand(serialBuffer);
-    serialIndex = 0;
-  }
-}
-
-// ==================== STATE MACHINE UPDATE ====================
-void updateStateMachine() {
-  switch (state) {
-
-    case ST_HOMING: {
-      HomingStatus status = motorsHomingUpdate(activeAxis);
-      if (status == HOMING_DONE) {
-        logAxisEvent(F("HOMING_DONE"), activeAxis, motorsSearchSteps(activeAxis));
-        if (autoHoming) {
-          homingIndex++;
-          continueAutoHoming();
-        } else {
-          setState(ST_IDLE);
-        }
-      } else if (status == HOMING_FAILED) {
-        logAxisError(F("HOMING_LIMIT_NOT_FOUND"), activeAxis);
-        autoHoming = false;
-        setState(ST_ERROR);
-      }
-      break;
-    }
-
-    case ST_MOVING_AXIS: {
-      MoveStatus status = motorsRunAxis(activeAxis);
-      if (status == MOVE_DONE) {
-        logAxisEvent(F("MOVE_DONE"), activeAxis, motorsPosition(activeAxis));
-        setState(ST_IDLE);
-      } else if (status == MOVE_LIMIT_HIT) {
-        logAxisEvent(F("LIMIT_HIT"), activeAxis, 0);
-        setState(ST_IDLE);
-      }
-      break;
-    }
-
-    case ST_GOTO_HOME_POSE:
-      if (!motorsRunAll()) {
-        waitStart = millis();
-        setState(ST_WAIT_BEFORE_A);
-      }
-      break;
-
-    case ST_WAIT_BEFORE_A:
-      if (millis() - waitStart >= DELAY_BEFORE_A_MS) {
-        motorsMoveTo(AXIS_A, HOME_POSE.a);
-        setState(ST_MOVING_A);
-      }
-      break;
-
-    case ST_MOVING_A:
-      if (motorsRunAxis(AXIS_A) != MOVE_RUNNING) {
-        logEvent(F("HOME_POSE_REACHED"));
-        logPosition();
-        setState(ST_IDLE);
-      }
-      break;
-
-    case ST_ROUTE_MOVING:
-      if (!motorsRunAll()) {
-        applyServo(ROUTE[routeStep].servoAngle);
-        logPosition();
-        waitStart = millis();
-        setState(ST_ROUTE_WAIT);
-      }
-      break;
-
-    case ST_ROUTE_WAIT:
-      if (millis() - waitStart >= DELAY_BETWEEN_POSES_MS) {
-        routeStep++;
-        startRouteStep();
-      }
-      break;
-
-    case ST_ERROR:
-      // Nothing moves. Reset the board and check the limit switch.
-      break;
-
-    default:
-      break;
+  // Si no llega salto de linea, procesa tras 150 ms de silencio
+  if (nbuf && !descartar && millis() - tUltimoChar >= 150) {
+    buf[nbuf] = '\0'; procesarLinea(buf); nbuf = 0;
   }
 }
 
-// ==================== SETUP / LOOP ====================
 void setup() {
   Serial.begin(115200);
-  Serial.setTimeout(100);
+  sensoresInit(LIMIT_PIN, HACIA_SENSOR, NIVEL_ACTIVO, NUM_MOTORES);
+  motoresInit(STEP_PIN, DIR_PIN, KEY_MOTOR);
+  servoConfigurar(SERVO_MIN, SERVO_MAX, SERVO_VEL_MAX, SERVO_VEL_DEF);
+  bool servoOk = servoInit(PIN_SCL, PIN_SDA, PCA_ADDR, CANAL_SERVO, KEY_SERVO);
 
-  logEvent(F("BOOT"));
-
-  sensorsInit();
-  motorsInit();
-
-  if (servoInit()) {
-    logEvent(F("SERVO_READY"));
-    servoMove(SERVO_OPEN_ANGLE);
-  } else {
-    logError(F("SERVO_NOT_FOUND"));
-  }
-
-  Serial.println(F("INFO,SCARA X Y A Z"));
-  Serial.println(F("INFO,Commands: X/Y/A/Z home | X500 | R/START/INICIAR | P/STOP | POS/?"));
-
-  startAutoHoming();
+  Serial.print(PREFIJO); Serial.println(F(",INFO,LISTO"));
+  Serial.print(PREFIJO); Serial.print(F(",INFO,SERVO=")); Serial.println(servoOk ? 1 : 0);
 }
 
 void loop() {
-  readSerial();
-  updateStateMachine();
-  streamPosition();
+  motoresActualizar();
+  servoActualizar();
+  leerSerial();
 }
